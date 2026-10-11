@@ -1,13 +1,22 @@
 import os
 import re
+import sys
 import time
 import json
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+
+# Windows環境でのコンソールUTF-8出力対策 (絵文字・Unicodeによるクラッシュ完全防止)
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from padlet_client import PadletClient
 
@@ -17,20 +26,18 @@ logger = logging.getLogger(__name__)
 class SpamMonitorEngine:
     """
     Padlet 荒らし監視・自動防衛・高速復旧エンジン (Ultra Defense 2.0)
-    
-    【防衛機能】
-    - セクション増殖荒らし即時遮断 & バックアップからの完全自動復旧（セクション＋投稿並列コピー）
-    - 20人同時荒らし・分散DDoS攻撃への並列一括処罰（スレッドプールによる0.5秒以内の全降格＆全削除）
-    - マルチアカウント協調荒らし（複数人による同一テキスト/画像爆撃）の網羅的検知
-    - 匿名/アカウント投稿の完全防衛（画像キャプション50文字制限、文字数上限、URLブロック、パターンマッチ）
-    - 全体権限(visitorRole)の強制ロックダウン（none/アクセスなし 対応）
-    - 削除後のダブルチェック再確認（残存ゼロ保証）
-    - Discord Webhook @everyone メンション付き詳細レポート
     """
 
-    def __init__(self, data_store_callback, log_callback):
+    def __init__(self, data_store_callback, log_callback, save_data_callback=None):
         self.get_data = data_store_callback
-        self.add_log = log_callback
+        # 絵文字やUnicodeによる例外から防衛エンジンを完全保護するセーフラッパー
+        def _safe_log(lvl, title, details=""):
+            try:
+                log_callback(str(lvl), str(title), str(details))
+            except Exception:
+                pass
+        self.add_log = _safe_log
+        self.save_data_callback = save_data_callback
         self.client = PadletClient()
         self.running = False
         self._thread: Optional[threading.Thread] = None
@@ -59,19 +66,19 @@ class SpamMonitorEngine:
     def send_notification(self, title: str, description: str, color: int = 0xFF4B4B, fields: Optional[List[Dict[str, Any]]] = None, mention_everyone: bool = True):
         """
         アラート・防衛通知送信
-        - Discord Webhookが設定されている場合: Discordに@everyoneメンション付きで即時送信
+        - Discord Webhookが設定されている場合: Discordのみに@everyoneメンション付きで即時送信 (Padlet側には投稿しない)
         - Discord Webhookが未設定(空)の場合: Padletボード内の指定通知セクションに自動投稿
         """
         data = self.get_data()
         webhook_url = data.get("discord_webhook_url", "").strip()
 
         if webhook_url:
-            # 1. Discord Webhook 通知
+            # 1. Discord Webhook 連携時は Webhook のみで通知
             embed = {
                 "title": f"🛡️ Padlet防衛Bot: {title}",
                 "description": description,
                 "color": color,
-                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "footer": {"text": "Padlet Anti-Spam Bot Ultra 2.0 • 24時間監視防衛システム"}
             }
             if fields:
@@ -88,9 +95,10 @@ class SpamMonitorEngine:
                     logger.warning(f"Discord通知ステータスコード異常: {res.status_code}")
             except Exception as e:
                 logger.error(f"Discord通知送信エラー: {e}")
-        else:
-            # 2. Padlet ボード内通知セクションへの投稿作成
-            self._send_padlet_board_notification(title, description, fields)
+            return  # Webhook通知完了。Padlet側への重複投稿は絶対にしない！
+
+        # 2. Webhook未設定時のみ、Padlet ボード内通知セクションへの投稿作成
+        self._send_padlet_board_notification(title, description, fields)
 
     def send_discord_webhook(self, title: str, description: str, color: int = 0xFF4B4B, fields: Optional[List[Dict[str, Any]]] = None, mention_everyone: bool = True):
         """後方互換用エイリアス"""
@@ -621,16 +629,27 @@ class SpamMonitorEngine:
                 with ThreadPoolExecutor(max_workers=8) as ex:
                     list(ex.map(_demote_collab, collab_map.items()))
 
-                time.sleep(0.5)
+                time.sleep(0.1)
 
                 # ステップ3: 一時セクションを作成し、既存の汚染セクションを一括削除
                 self.add_log("RECOVERY", "【フェーズ2】汚染セクションの初期化中...")
                 temp_sec = self.client.create_section(main_wall_id, "_safe_restore_guard_")
-                time.sleep(0.3)
+                time.sleep(0.05)
 
                 for s in polluted_sections:
                     self.client.delete_section(s["id"])
-                    time.sleep(0.05)
+                    time.sleep(0.02)
+
+                # 元のメイン通知セクション名(タイトル)の特定
+                orig_notif_sec_id = str(data.get("notification_section_id") or "")
+                orig_notif_title = data.get("notification_section_title")
+                if not orig_notif_title and orig_notif_sec_id and polluted_sections:
+                    for s in polluted_sections:
+                        if str(s.get("id")) == orig_notif_sec_id or str(s.get("hashid")) == orig_notif_sec_id:
+                            orig_notif_title = s.get("title")
+                            break
+                if not orig_notif_title:
+                    orig_notif_title = "🔔防衛Bot通知"
 
                 if not backup_wall_id or not backup_wall_hashid:
                     self.add_log("WARN", "バックアップボード情報が未設定のため、セクション初期化のみで終了します")
@@ -640,13 +659,43 @@ class SpamMonitorEngine:
                     self.is_restoring = False
                     return
 
-                # ステップ4: バックアップからセクション再作成 & マッピングテーブル構築
-                self.add_log("RECOVERY", "【フェーズ3】バックアップからセクション再構築中...")
+                # バックアップセクション一覧の取得
                 backup_sections = self.client.get_sections(backup_wall_id)
                 backup_posts = self.client.get_posts(backup_wall_hashid)
 
+                # Webhook未設定時: バックアップ部屋のメイン通知セクションと同名のセクションへ荒らし検知を通知
+                webhook_url = data.get("discord_webhook_url", "").strip()
+                if not webhook_url:
+                    target_b_sec = next((bs for bs in backup_sections if bs.get("title") == orig_notif_title), None)
+                    if not target_b_sec:
+                        target_b_sec = next((bs for bs in backup_sections if "通知" in bs.get("title", "") or "ログ" in bs.get("title", "")), None)
+                    
+                    if target_b_sec:
+                        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        b_sec_id = target_b_sec.get("id")
+                        b_body = (
+                            f"【🛡️ Padlet防衛Bot通知】\n"
+                            f"⚠️ メイン部屋でセクション増殖荒らし({len(polluted_sections)}個)を検知しました！\n"
+                            f"▶ 全体権限を緊急ロックダウンし、汚染セクションを初期化してバックアップから完全復元を開始しています。\n"
+                            f"⏱️ 発生時刻: {now_str}"
+                        )
+                        self.client.create_post(
+                            wall_id=backup_wall_id,
+                            subject="🛡️ [防衛通知] セクション増殖荒らしを検知・復旧シーケンス開始",
+                            body=b_body,
+                            section_id=str(b_sec_id) if b_sec_id else None,
+                            board_hashid=backup_wall_hashid,
+                            custom_key=data.get("custom_key"),
+                            custom_value=data.get("custom_value")
+                        )
+                        self.add_log("NOTIFICATION", f"バックアップの同名セクション({target_b_sec.get('title')})に荒らし通知を送信しました")
+
+                # ステップ4: バックアップからセクション再作成 & マッピングテーブル構築
+                self.add_log("RECOVERY", "【フェーズ3】バックアップからセクション再構築中...")
+
                 section_id_map: Dict[str, str] = {}
                 first_created_sec_id = None
+                new_notif_sec_id = None
 
                 for b_sec in backup_sections:
                     created_sec = self.client.create_section(main_wall_id, b_sec["title"])
@@ -662,7 +711,21 @@ class SpamMonitorEngine:
                             section_id_map[str(b_sec["hashid"])] = c_id
                         if b_sec.get("title"):
                             section_id_map[str(b_sec["title"])] = c_id
-                    time.sleep(0.1)
+
+                        # メイン部屋で通知セクションに指定していたセクションと同名の場合、新IDを記録
+                        if b_sec.get("title") == orig_notif_title:
+                            new_notif_sec_id = c_id
+                    time.sleep(0.02)
+
+                # 完全一致がなければ「通知」または「ログ」を含むセクション、または先頭セクション
+                if not new_notif_sec_id:
+                    for b_sec in backup_sections:
+                        if "通知" in b_sec.get("title", "") or "ログ" in b_sec.get("title", ""):
+                            new_notif_sec_id = section_id_map.get(b_sec.get("title"))
+                            orig_notif_title = b_sec.get("title")
+                            break
+                if not new_notif_sec_id and first_created_sec_id:
+                    new_notif_sec_id = first_created_sec_id
 
                 # ステップ5: バックアップから投稿を並列コピー
                 self.add_log("RECOVERY", f"【フェーズ4】バックアップから投稿を復元中... (対象: {len(backup_posts)}件)")
@@ -710,6 +773,17 @@ class SpamMonitorEngine:
                 if temp_sec:
                     self.client.delete_section(temp_sec["id"])
 
+                # バックアップ復元完了: 通知セクションを新IDへ自動で上書き更新
+                if new_notif_sec_id:
+                    data["notification_section_id"] = new_notif_sec_id
+                    data["notification_section_title"] = orig_notif_title
+                    if self.save_data_callback:
+                        try:
+                            self.save_data_callback()
+                        except Exception as se:
+                            logger.error(f"設定自動保存エラー: {se}")
+                    self.add_log("CONFIG", f"通知先セクションを復元後の新ID({new_notif_sec_id})に自動上書き更新しました", f"セクション名: {orig_notif_title}")
+
                 # ステップ6: 全体権限を設定値に戻す
                 self.client.change_visitor_role(main_wall_hashid, expected_visitor_role, wall_id=main_wall_id)
 
@@ -732,6 +806,7 @@ class SpamMonitorEngine:
                         {"name": "📂 復元されたセクション数", "value": f"{len(backup_sections)} 個", "inline": True},
                         {"name": "📝 復元された投稿数", "value": f"{restored_posts_count} 件 / {len(backup_posts)} 件", "inline": True},
                         {"name": "🔍 整合性ダブルチェック", "value": "合格 (完全一致)" if is_correct else "一部要確認", "inline": True},
+                        {"name": "🔔 通知セクション更新", "value": f"新IDに自動上書き済 ({orig_notif_title})", "inline": True},
                         {"name": "🛡️ 権限ロックダウン", "value": "セーフ管理者・モデレーター・部屋主以外を一括降格済", "inline": False}
                     ],
                     mention_everyone=True

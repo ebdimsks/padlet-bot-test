@@ -627,6 +627,7 @@
       (sections || []).forEach(s => {
         const opt = document.createElement('option');
         opt.value = s.id;
+        opt.setAttribute('data-title', s.title || '');
         opt.textContent = `${s.title} (ID: ${s.id})`;
         if (selectedId && String(s.id) === String(selectedId)) {
           opt.selected = true;
@@ -710,7 +711,9 @@
       const sessionToken = document.getElementById('padletSessionToken').value;
       const secToken = document.getElementById('padletSecondaryToken').value;
       const webhook = document.getElementById('discordWebhook').value;
-      const notifSec = document.getElementById('notificationSectionSelect').value;
+      const notifSelect = document.getElementById('notificationSectionSelect');
+      const notifSec = notifSelect ? notifSelect.value : null;
+      const notifTitle = (notifSelect && notifSelect.selectedOptions && notifSelect.selectedOptions[0]) ? notifSelect.selectedOptions[0].getAttribute('data-title') || '' : '';
       const customKey = document.getElementById('customKeyInput').value.trim();
       const customVal = document.getElementById('customValueInput').value.trim();
       const interval = parseFloat(document.getElementById('pollInterval').value);
@@ -723,6 +726,7 @@
           padlet_secondary_token: secToken,
           discord_webhook_url: webhook,
           notification_section_id: notifSec || null,
+          notification_section_title: notifTitle || '',
           custom_key: customKey,
           custom_value: customVal,
           poll_interval_seconds: interval,

@@ -9,6 +9,14 @@ from flask import Flask, request, jsonify, render_template, session
 from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 
+# Windows環境でのコンソールUTF-8出力対策
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from padlet_client import PadletClient
 from monitor_engine import SpamMonitorEngine
 
@@ -127,6 +135,7 @@ def load_config() -> dict:
             _config_cache.setdefault("main_board", {})
             _config_cache.setdefault("backup_board", {})
             _config_cache.setdefault("notification_section_id", None)
+            _config_cache.setdefault("notification_section_title", "")
             _config_cache.setdefault("custom_key", "")
             _config_cache.setdefault("custom_value", "")
             _config_cache.setdefault("allowed_admins", [])
@@ -175,7 +184,7 @@ def add_log(level: str, title: str, details: str = ""):
 
 
 # 監視エンジン初期化
-engine = SpamMonitorEngine(load_config, add_log)
+engine = SpamMonitorEngine(load_config, add_log, save_config)
 
 
 def auth_required(f):
@@ -233,7 +242,7 @@ def api_save_config():
     # 更新可能なフィールド
     for key in [
         "padlet_api_key", "padlet_session_token", "padlet_secondary_token", "padlet_token", "discord_webhook_url",
-        "notification_section_id", "custom_key", "custom_value",
+        "notification_section_id", "notification_section_title", "custom_key", "custom_value",
         "allowed_admins", "allowed_moderators", "exempt_admins",
         "max_sections", "poll_interval_seconds", "default_visitor_role", "ddos_threshold",
         "delete_non_collaborators", "block_duplicates", "block_image_repeat", "block_urls", "max_post_length", "random_str_pattern"
@@ -296,8 +305,10 @@ def api_resolve_board():
             notify_sec = next((s for s in sections if "通知" in s.get("title", "") or "ログ" in s.get("title", "")), None)
             if notify_sec:
                 cfg["notification_section_id"] = notify_sec["id"]
+                cfg["notification_section_title"] = notify_sec["title"]
             else:
                 cfg["notification_section_id"] = sections[0]["id"]
+                cfg["notification_section_title"] = sections[0]["title"]
     else:
         cfg["backup_board"] = resolved
 
@@ -352,6 +363,7 @@ def api_create_notify_section():
         return jsonify({"error": "通知セクションの作成に失敗しました"}), 500
 
     cfg["notification_section_id"] = created["id"]
+    cfg["notification_section_title"] = sec_title
     save_config()
     add_log("SECTION", f"通知用セクションを作成しました: {sec_title} (ID: {created['id']})")
 
