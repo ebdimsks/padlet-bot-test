@@ -235,11 +235,57 @@ class SpamMonitorEngine:
             # 高速かつ安全なポーリング待機 (最小0.5秒)
             time.sleep(max(float(self.get_data().get("poll_interval_seconds", 1.0)), 0.5))
 
+    @staticmethod
+    def _clean_user_id(val: Any) -> str:
+        """ユーザーID・ユーザー名・スラッグの統一正規化 (@除去、小文字化、トリム)"""
+        if val is None:
+            return ""
+        s = str(val).strip().lower()
+        if s.startswith("@"):
+            s = s[1:].strip()
+        return s
+
+    @classmethod
+    def _extract_identifiers(cls, cinfo: Dict[str, Any]) -> Set[str]:
+        """コラボレーター情報からすべての識別子 (ユーザーID, username, name, hashid) を抽出"""
+        res = set()
+        for k in ("user_id", "username", "name", "hashid", "id", "userId"):
+            v = cinfo.get(k)
+            if v:
+                cv = cls._clean_user_id(v)
+                if cv and cv not in ("unknown", "anonymous", "none", "null", ""):
+                    res.add(cv)
+        return res
+
+    @classmethod
+    def _is_owner_post(cls, p: Dict[str, Any], owner_identifiers: Set[str], collab_map: Optional[Dict[str, Any]] = None) -> bool:
+        """ボード作成者(owner / creator)の投稿かどうかを確実に判定"""
+        if not owner_identifiers:
+            return False
+        p_aid = cls._clean_user_id(p.get("author_id"))
+        p_aname = cls._clean_user_id(p.get("author_name"))
+
+        if p_aid and p_aid != "anonymous" and p_aid in owner_identifiers:
+            return True
+        if p_aname and p_aname not in ("unknown", "anonymous", "none", "null", "", "guest") and p_aname in owner_identifiers:
+            return True
+
+        if collab_map and p_aid in collab_map:
+            c_ids = cls._extract_identifiers(collab_map[p_aid])
+            if c_ids & owner_identifiers:
+                return True
+        return False
+
     def _demote_unauthorized_admins_and_mods(self, main_wall_id: int, main_wall_hashid: str, collab_map: Dict[str, Any], owner_id: Optional[str], exempt_admins: Set[str]) -> List[str]:
         """
         セクション荒らし検知時: 降格免除リスト(exempt_admins)および部屋主(owner_id)以外の
         すべての管理者(admin/owner)とモデレーター(moderator)の権限を確実に writer に降格する。
         """
+        exempt_clean = {self._clean_user_id(x) for x in exempt_admins if self._clean_user_id(x)}
+        owner_clean = {self._clean_user_id(owner_id)} if owner_id else set()
+        if getattr(self.client, "owner_id", None):
+            owner_clean.add(self._clean_user_id(self.client.owner_id))
+
         # 最新のコラボレーター情報を再取得して統合
         latest_collabs = self.client.get_collaborators(main_wall_hashid, main_wall_id)
         current_map = dict(collab_map)
@@ -247,16 +293,27 @@ class SpamMonitorEngine:
             uid = c.get("user_id")
             if uid and uid != "anonymous":
                 current_map[uid] = c
+            if c.get("username"):
+                current_map[c["username"]] = c
 
-        exempt_lower = {str(x).strip().lower() for x in exempt_admins if str(x).strip()}
-        owner_str = str(owner_id).strip().lower() if owner_id else ""
+        # 部屋主の識別子を current_map から補完
+        for uid, cinfo in current_map.items():
+            role = (cinfo.get("role") or "").lower()
+            if role in ("owner", "builder") or cinfo.get("is_owner"):
+                owner_clean.update(self._extract_identifiers(cinfo))
 
         targets = []
         for uid, cinfo in current_map.items():
-            uid_str = str(uid).strip()
-            if not uid_str or uid_str == "anonymous":
+            c_ids = self._extract_identifiers(cinfo)
+            if not c_ids:
+                c_ids = {self._clean_user_id(uid)}
+
+            # 部屋主保護 (絶対に降格しない)
+            if c_ids & owner_clean:
                 continue
-            if owner_str and uid_str.lower() == owner_str:
+
+            # 降格免除リスト保護 (プロフィールのユーザーID、数値ID、hashid、nameすべてで確実に照合)
+            if c_ids & exempt_clean:
                 continue
 
             username = str(cinfo.get("username") or "").strip()
@@ -264,34 +321,26 @@ class SpamMonitorEngine:
             hashid = str(cinfo.get("hashid") or "").strip()
             role = str(cinfo.get("role") or "").strip().lower()
 
-            # 降格免除リスト判定 (UID, username, name, hashid のいずれかが一致すれば免除・保護)
-            if (uid_str.lower() in exempt_lower or
-                (username and username.lower() in exempt_lower) or
-                (name and name.lower() in exempt_lower) or
-                (hashid and hashid.lower() in exempt_lower)):
-                continue
-
             # 管理者・モデレーターのみを対象として writer に降格
             if role in ("admin", "owner", "moderator"):
-                targets.append((uid_str, hashid, username or name or uid_str, role))
+                target_ids = list(filter(None, [uid, cinfo.get("user_id"), hashid, username]))
+                targets.append((target_ids, username or name or str(uid), role))
 
         demoted_names = []
         if targets:
-            def _demote_single(target):
-                u_id, h_id, uname, old_role = target
+            def _demote_single(item):
+                t_ids, uname, old_role = item
                 success = False
-                # user_id で降格試行
-                if self.client.change_user_role(main_wall_id, u_id, "writer", board_hashid=main_wall_hashid):
-                    success = True
-                # hashid でも試行
-                elif h_id and self.client.change_user_role(main_wall_id, h_id, "writer", board_hashid=main_wall_hashid):
-                    success = True
+                for tid in t_ids:
+                    if self.client.change_user_role(main_wall_id, str(tid), "writer", board_hashid=main_wall_hashid):
+                        success = True
+                        break
 
                 if success:
-                    self.add_log("SECURITY", f"セクション荒らし防衛降格: {uname} (ID: {u_id}, {old_role} ➜ writer)")
+                    self.add_log("SECURITY", f"セクション荒らし防衛降格: {uname} ({old_role} ➜ writer)")
                     return uname
                 else:
-                    self.add_log("WARN", f"管理者降格試行完了: {uname} (ID: {u_id})")
+                    self.add_log("WARN", f"管理者降格リクエスト送信完了: {uname}")
                     return uname
 
             with ThreadPoolExecutor(max_workers=min(max(len(targets), 4), 16)) as executor:
@@ -301,6 +350,20 @@ class SpamMonitorEngine:
                     if res:
                         demoted_names.append(res)
 
+            # 【再確認・ダブルチェック】確実にライターにおろすための再検証 & リトライ
+            time.sleep(0.3)
+            verify_collabs = self.client.get_collaborators(main_wall_hashid, main_wall_id)
+            for vc in verify_collabs:
+                vc_ids = self._extract_identifiers(vc)
+                if (vc_ids & owner_clean) or (vc_ids & exempt_clean):
+                    continue
+                vc_role = (vc.get("role") or "").lower()
+                if vc_role in ("admin", "owner", "moderator"):
+                    vc_uid = vc.get("user_id") or vc.get("username") or vc.get("hashid")
+                    if vc_uid:
+                        self.client.change_user_role(main_wall_id, str(vc_uid), "writer", board_hashid=main_wall_hashid)
+                        self.add_log("SECURITY", f"ダブルチェック再降格: {vc.get('username') or vc_uid} ➜ writer")
+
         return demoted_names
 
     def _check_cycle(self, data: Dict[str, Any], main_wall_id: int, main_wall_hashid: str):
@@ -309,10 +372,15 @@ class SpamMonitorEngine:
         main_board_info = data.get("main_board", {})
         owner_id = str(main_board_info.get("owner_id", "")) if main_board_info.get("owner_id") else None
 
-        # 許可・免除リスト
-        allowed_admins = set(str(x) for x in data.get("allowed_admins", []))
-        allowed_mods = set(str(x) for x in data.get("allowed_moderators", []))
-        exempt_admins = set(str(x) for x in data.get("exempt_admins", []))
+        # 許可・免除リスト (プロフィールのユーザー名、@付き、数値IDのすべてに対応する正規化セット)
+        allowed_admin_set = {self._clean_user_id(x) for x in data.get("allowed_admins", []) if self._clean_user_id(x)}
+        allowed_mod_set = {self._clean_user_id(x) for x in data.get("allowed_moderators", []) if self._clean_user_id(x)}
+        exempt_admin_set = {self._clean_user_id(x) for x in data.get("exempt_admins", []) if self._clean_user_id(x)}
+
+        # 後方互換セット
+        allowed_admins = set(allowed_admin_set)
+        allowed_mods = set(allowed_mod_set)
+        exempt_admins = set(exempt_admin_set)
 
         # =====================================================================
         # 1. 全体アクセス設定 (visitorRole) の監視 & 強制修復 (commenter, none等に対応)
@@ -336,7 +404,7 @@ class SpamMonitorEngine:
                 current_visitor_role = expected_visitor_role
 
         # =====================================================================
-        # 2. コラボレーター情報の取得 & 不正管理者・モデレーター昇格の検知・即降格
+        # 2. コラボレーター情報の取得 & キャッシュ更新
         # =====================================================================
         collaborators = self.client.get_collaborators(main_wall_hashid, main_wall_id)
         if collaborators:
@@ -344,65 +412,149 @@ class SpamMonitorEngine:
                 uid = c.get("user_id")
                 if uid and uid != "anonymous":
                     self.cached_collab_map[uid] = c
-                    self.cached_collab_identifiers.add(str(uid).strip())
+                    self.cached_collab_identifiers.add(self._clean_user_id(uid))
                 if c.get("hashid"):
-                    self.cached_collab_identifiers.add(str(c["hashid"]).strip())
+                    self.cached_collab_identifiers.add(self._clean_user_id(c["hashid"]))
                 if c.get("username"):
-                    self.cached_collab_identifiers.add(str(c["username"]).strip().lower())
+                    self.cached_collab_identifiers.add(self._clean_user_id(c["username"]))
                 if c.get("name"):
-                    self.cached_collab_identifiers.add(str(c["name"]).strip().lower())
+                    self.cached_collab_identifiers.add(self._clean_user_id(c["name"]))
 
         collab_map = dict(self.cached_collab_map)
         for c in collaborators:
             if c.get("user_id"):
                 collab_map[c["user_id"]] = c
+            if c.get("username"):
+                collab_map[c["username"]] = c
+
+        # ボード作成者(owner / creator)の包括的識別子セットの構築 (プロフィールのユーザーIDにも完全対応)
+        owner_identifiers: Set[str] = set()
+        if owner_id:
+            owner_identifiers.add(self._clean_user_id(owner_id))
+        for k in ("owner_id", "builder_id", "creator_id", "owner_username", "username"):
+            v = main_board_info.get(k)
+            if v:
+                owner_identifiers.add(self._clean_user_id(v))
+        if getattr(self.client, "owner_id", None):
+            owner_identifiers.add(self._clean_user_id(self.client.owner_id))
+
+        # collab_map から role が owner / builder のコラボレーターも自動認識
+        for uid, cinfo in collab_map.items():
+            role = (cinfo.get("role") or "").lower()
+            if role in ("owner", "builder") or cinfo.get("is_owner"):
+                owner_identifiers.update(self._extract_identifiers(cinfo))
 
         # コラボレーター（=権限が決められている人）の識別子セット (ID, hashid, ユーザー名, 表示名)
-        registered_collab_identifiers: Set[str] = set(self.cached_collab_identifiers)
-        if owner_id:
-            registered_collab_identifiers.add(str(owner_id).strip())
-            self.cached_collab_identifiers.add(str(owner_id).strip())
-        for adm in allowed_admins:
-            registered_collab_identifiers.add(str(adm).strip().lower())
-            self.cached_collab_identifiers.add(str(adm).strip().lower())
-        for mod in allowed_mods:
-            registered_collab_identifiers.add(str(mod).strip().lower())
-            self.cached_collab_identifiers.add(str(mod).strip().lower())
-        for ex in exempt_admins:
-            registered_collab_identifiers.add(str(ex).strip().lower())
-            self.cached_collab_identifiers.add(str(ex).strip().lower())
+        registered_collab_identifiers: Set[str] = set(self.cached_collab_identifiers) | owner_identifiers | allowed_admin_set | allowed_mod_set | exempt_admin_set
+        self.cached_collab_identifiers.update(registered_collab_identifiers)
 
         def is_collaborator(uid: str, uname: str = "") -> bool:
             """コラボレーター(=権限が決められている人、共有に招待されている人)かどうかを判定"""
             if not uid or uid == "anonymous":
                 return False
-            uid_str = str(uid).strip()
-            if uid_str in registered_collab_identifiers or uid_str in self.cached_collab_identifiers:
+            u_clean = self._clean_user_id(uid)
+            if u_clean in registered_collab_identifiers or u_clean in self.cached_collab_identifiers:
                 return True
             if uname:
-                uname_str = str(uname).strip().lower()
-                if uname_str and uname_str not in ("unknown", "anonymous", "none"):
-                    if uname_str in registered_collab_identifiers or uname_str in self.cached_collab_identifiers:
+                un_clean = self._clean_user_id(uname)
+                if un_clean and un_clean not in ("unknown", "anonymous", "none", "null"):
+                    if un_clean in registered_collab_identifiers or un_clean in self.cached_collab_identifiers:
                         return True
             return False
 
-        # 不正管理者・モデレーター昇格の検知
-        for uid, cinfo in collab_map.items():
-            if owner_id and uid == owner_id:
+        # =====================================================================
+        # 2.1 降格免除アカウントの権限監視 & 即時復元 (指示遵守)
+        # 「降格免除リストで指定したidのアカウントは、権限が下げられた瞬間に、元の権限に戻すように。
+        #   元の権限は、許可管理者、許可モデレーターのどっちにいるのかで決めるように」
+        # =====================================================================
+        seen_exempt_users = set()
+        for uid, cinfo in list(collab_map.items()):
+            c_ids = self._extract_identifiers(cinfo)
+            if not (c_ids & exempt_admin_set):
+                continue  # 免除アカウントではない
+            # 重複判定防止
+            c_key = cinfo.get("user_id") or cinfo.get("username") or uid
+            if c_key in seen_exempt_users:
                 continue
+            seen_exempt_users.add(c_key)
+
+            # 本来あるべき元の権限を判定:
+            # 許可モデレーターリストに含まれ、許可管理者にない場合は moderator、それ以外は admin
+            if (c_ids & allowed_mod_set) and not (c_ids & allowed_admin_set):
+                target_role = "moderator"
+            else:
+                target_role = "admin"
+
+            curr_role = (cinfo.get("role") or "").lower()
+
+            # 権限が下げられているか？
+            is_demoted = False
+            if target_role == "admin" and curr_role not in ("admin", "owner"):
+                is_demoted = True
+            elif target_role == "moderator" and curr_role in ("writer", "commenter", "reader", "none", ""):
+                is_demoted = True
+
+            if is_demoted:
+                uname = cinfo.get("username") or cinfo.get("name") or uid
+                # user_id, username, hashid を使って元の権限に即座に復元！
+                restored = False
+                for tid in filter(None, [cinfo.get("user_id"), cinfo.get("username"), uid, cinfo.get("hashid")]):
+                    if self.client.change_user_role(main_wall_id, str(tid), target_role, board_hashid=main_wall_hashid):
+                        restored = True
+                        break
+
+                if restored:
+                    cinfo["role"] = target_role
+                    collab_map[uid] = cinfo
+                    self.cached_collab_map[uid] = cinfo
+                    msg = f"🛡️ 降格免除アカウント権限改変検知 ➜ 即座に復元: {uname} (ID: {uid}) を元の権限 [{target_role}] に復元しました"
+                    self.add_log("SECURITY", msg)
+                    self.send_discord_webhook(
+                        "🛡️ 免除アカウント権限即時復元",
+                        f"降格免除アカウント `{uname}` の権限が `{curr_role}` に下げられていたため、即座に本来の権限 `{target_role}` に復元しました。",
+                        color=0x00FF88,
+                        fields=[
+                            {"name": "対象アカウント", "value": f"`{uname}` (ID: `{uid}`)", "inline": True},
+                            {"name": "改変された権限", "value": f"`{curr_role}`", "inline": True},
+                            {"name": "復元された本来の権限", "value": f"`{target_role}`", "inline": True}
+                        ],
+                        mention_everyone=False
+                    )
+
+        # コラボレーターから追放された免除アカウントの即時再招待・復元
+        registered_collab_clean_ids = set()
+        for c in collab_map.values():
+            registered_collab_clean_ids.update(self._extract_identifiers(c))
+
+        for ex_clean in exempt_admin_set:
+            if ex_clean not in registered_collab_clean_ids:
+                target_role = "moderator" if (ex_clean in allowed_mod_set and ex_clean not in allowed_admin_set) else "admin"
+                if self.client.change_user_role(main_wall_id, ex_clean, target_role, board_hashid=main_wall_hashid):
+                    self.add_log("SECURITY", f"追放された降格免除アカウントを即座に再登録・復元: {ex_clean} ({target_role})")
+
+        # =====================================================================
+        # 2.2 不正管理者・モデレーター昇格の検知 & 即時降格
+        # =====================================================================
+        for uid, cinfo in collab_map.items():
+            c_ids = self._extract_identifiers(cinfo)
+            if c_ids & owner_identifiers:
+                continue  # ボード作成者は保護
+            if c_ids & exempt_admin_set:
+                continue  # 免除アカウントは保護
+
             role = (cinfo.get("role") or "").lower()
             username = cinfo.get("username") or cinfo.get("name") or uid
 
             if role in ("admin", "owner"):
-                if uid not in allowed_admins and username not in allowed_admins and uid not in exempt_admins and username not in exempt_admins:
-                    self.client.change_user_role(main_wall_id, uid, "writer")
+                if not (c_ids & allowed_admin_set):
+                    self.client.change_user_role(main_wall_id, uid, "writer", board_hashid=main_wall_hashid)
                     msg = f"未許可の管理者昇格を検知: {username} (ID: {uid}) を writer に降格しました"
                     self.add_log("SECURITY", msg)
                     self.send_discord_webhook("不正管理者検知・即時降格", msg, color=0xFFA500)
 
             elif role == "moderator":
-                if uid not in allowed_mods and username not in allowed_mods and uid not in exempt_admins and username not in exempt_admins:
-                    self.client.change_user_role(main_wall_id, uid, "writer")
+                if not (c_ids & allowed_mod_set):
+                    self.client.change_user_role(main_wall_id, uid, "writer", board_hashid=main_wall_hashid)
                     msg = f"未許可のモデレーター昇格を検知: {username} (ID: {uid}) を writer に降格しました"
                     self.add_log("SECURITY", msg)
                     self.send_discord_webhook("不正モデレーター検知・即時降格", msg, color=0xFFA500)
@@ -500,14 +652,22 @@ class SpamMonitorEngine:
         # 【投稿荒らし検知 ①】1秒間に2投稿以上、または2秒間に4投稿以上
         # 「その荒らした人だけ」荒らし判定にする。処罰は読者。荒らしに検知した人の投稿は絶対にすべて削除。
         # -------------------------------------------------------------
+        # -------------------------------------------------------------
+        # 【投稿荒らし検知 ①】1秒間に2投稿以上、または2秒間に4投稿以上
+        # 「その荒らした人だけ」荒らし判定にする。処罰は読者。荒らしに検知した人の投稿は絶対にすべて削除。
+        # ※ボード作成者の投稿は絶対に削除しない！
+        # -------------------------------------------------------------
         for p in new_posts:
+            if self._is_owner_post(p, owner_identifiers, collab_map):
+                continue  # ボード作成者の投稿は絶対に保護
             aid = str(p.get("author_id", "") or "").strip()
             aname = str(p.get("author_name", "") or "").strip()
             if not aid or aid == "anonymous":
                 continue  # 匿名投稿は特定アカウント処罰(読者降格)の対象外
-            if owner_id and aid == owner_id:
-                continue
-            if aid in exempt_admins or aname in exempt_admins or collab_map.get(aid, {}).get("username") in exempt_admins:
+
+            p_cinfo = collab_map.get(aid) or collab_map.get(aname) or {}
+            p_ids = self._extract_identifiers(p_cinfo) | {self._clean_user_id(aid), self._clean_user_id(aname)}
+            if p_ids & exempt_admin_set:
                 continue
 
             fp = f"{p.get('subject', '')}:::{p.get('content', '')}"
@@ -535,12 +695,14 @@ class SpamMonitorEngine:
         for aid, timestamps in list(self.user_post_timestamps.items()):
             if not aid or aid == "anonymous":
                 continue
+            if self._clean_user_id(aid) in owner_identifiers:
+                continue
             valid_ts = [t for t in timestamps if now - t <= 10.0]
             self.user_post_timestamps[aid] = valid_ts
 
-            if owner_id and aid == owner_id:
-                continue
-            if aid in exempt_admins or collab_map.get(aid, {}).get("username") in exempt_admins:
+            p_cinfo = collab_map.get(aid) or {}
+            p_ids = self._extract_identifiers(p_cinfo) | {self._clean_user_id(aid)}
+            if (p_ids & owner_identifiers) or (p_ids & exempt_admin_set):
                 continue
 
             # 精密間隔判定: 1秒間に2投稿以上 または 2秒間に4投稿以上
@@ -558,16 +720,20 @@ class SpamMonitorEngine:
         # -------------------------------------------------------------
         # 【投稿荒らし検知 ②】同じ画像を短期間に複数投稿
         # 「その荒らした人だけ」荒らし判定にする。処罰は読者。荒らしに検知した人の投稿は絶対にすべて削除。
+        # ※ボード作成者の投稿は絶対に削除しない！
         # -------------------------------------------------------------
         for p in new_posts:
+            if self._is_owner_post(p, owner_identifiers, collab_map):
+                continue  # ボード作成者は保護
             pid = str(p.get("id", ""))
             aid = str(p.get("author_id", "") or "").strip()
             aname = str(p.get("author_name", "") or "").strip()
             if not pid:
                 continue
-            if owner_id and aid == owner_id:
-                continue
-            if aid in exempt_admins or aname in exempt_admins or collab_map.get(aid, {}).get("username") in exempt_admins:
+
+            p_cinfo = collab_map.get(aid) or collab_map.get(aname) or {}
+            p_ids = self._extract_identifiers(p_cinfo) | {self._clean_user_id(aid), self._clean_user_id(aname)}
+            if (p_ids & owner_identifiers) or (p_ids & exempt_admin_set):
                 continue
 
             fp = f"{p.get('subject', '')}:::{p.get('content', '')}"
@@ -599,10 +765,10 @@ class SpamMonitorEngine:
 
         # -------------------------------------------------------------
         # 【読者にはしないけど、投稿を削除するやつ】
-        # ① 画像のキャプションのところが文字数制限(デフォルト50文字)以上の投稿
-        #    ※タイトルおよび本文には文字数制限なし（無制限）
-        # ② コラボレーター以外の投稿
-        #    ※「全体の権限がライターの場合は、コラボレーターにいなくても、投稿は消さない」
+        # ① 管理者・モデレーター権限がない人のピン留め投稿を削除 (バグ・裏技対策)
+        # ② 画像のキャプションのところが文字数制限(デフォルト50文字)以上の投稿 (タイトル・本文は無制限)
+        # ③ コラボレーター以外の投稿 (※全体の権限がライターの場合は消さない)
+        # ※ボード作成者の投稿は絶対に削除しない！
         # -------------------------------------------------------------
         raw_caption_limit = data.get("max_caption_length", data.get("max_post_length", 50))
         try:
@@ -616,16 +782,46 @@ class SpamMonitorEngine:
             aname = str(p.get("author_name", "") or "").strip()
             if not pid:
                 continue
-            if owner_id and aid == owner_id:
-                continue  # 部屋主は保護
-            if aid in exempt_admins or aname in exempt_admins or collab_map.get(aid, {}).get("username") in exempt_admins:
+
+            # ボード作成者の投稿は絶対に消さない！ (指示遵守)
+            if self._is_owner_post(p, owner_identifiers, collab_map):
+                continue
+
+            p_cinfo = collab_map.get(aid) or collab_map.get(aname) or {}
+            p_ids = self._extract_identifiers(p_cinfo) | {self._clean_user_id(aid), self._clean_user_id(aname)}
+            if p_ids & owner_identifiers:
                 continue
 
             fp = f"{p.get('subject', '')}:::{p.get('content', '')}"
             if fp in self.protected_post_fingerprints or (p.get("subject") or "").startswith("🛡️ [防衛通知]"):
                 continue
 
-            # ① 画像キャプションが制限(デフォルト50文字)以上 -> 投稿のみ削除 (読者にはしない)
+            # ① 管理者とモデレーターの権限がない人以外がピン止めをした投稿をしたら、その投稿を削除
+            if p.get("pinned"):
+                has_pin_privilege = False
+                author_role = (p_cinfo.get("role") or "").lower()
+                if author_role in ("admin", "owner", "moderator"):
+                    has_pin_privilege = True
+                elif p_ids & (allowed_admin_set | allowed_mod_set | exempt_admin_set):
+                    has_pin_privilege = True
+
+                if not has_pin_privilege:
+                    posts_to_delete.add(pid)
+                    author_label = aname or aid or "Unknown"
+                    self.add_log("SECURITY", f"権限外ピン止め投稿を検知・即時削除: {author_label} (PostID: {pid})", "管理者・モデレーター権限がないユーザーによるピン留め投稿")
+                    self.send_discord_webhook(
+                        "📌 不正ピン留め投稿即時削除",
+                        f"管理者・モデレーター権限のないユーザー `{author_label}` によるピン留め投稿を検知し、即座に削除しました。\n- 投稿ID: `{pid}`",
+                        color=0xFFA500,
+                        mention_everyone=False
+                    )
+                    continue
+
+            # 免除アカウントは以後の削除判定から保護
+            if p_ids & exempt_admin_set:
+                continue
+
+            # ② 画像キャプションが制限(デフォルト50文字)以上 -> 投稿のみ削除 (読者にはしない)
             # ※タイトルおよび本文には文字数制限はありません（無制限）
             if max_caption_len > 0:
                 caption = str(p.get("attachment_caption") or "").strip()
@@ -634,7 +830,7 @@ class SpamMonitorEngine:
                     self.add_log("DEFENSE", f"画像キャプション文字数超過({max_caption_len}文字以上)の投稿を削除: {len(caption)}文字 (PostID: {pid})")
                     continue
 
-            # ② コラボレーター以外の投稿 -> 投稿のみ削除 (読者にはしない)
+            # ③ コラボレーター以外の投稿 -> 投稿のみ削除 (読者にはしない)
             # ※「全体の権限がライターの場合は、コラボレーターにいなくても、投稿は消さない」
             if delete_non_collab and not is_general_writer:
                 # セーフガード: コラボレーターキャッシュまたは一覧が1件以上ある場合のみ実行
@@ -657,9 +853,10 @@ class SpamMonitorEngine:
             cid = str(c.get("id", ""))
             if not cid:
                 continue
-            if owner_id and c_aid == owner_id:
-                continue
-            if c_aid in exempt_admins or c_aname in exempt_admins:
+
+            c_cinfo = collab_map.get(c_aid) or collab_map.get(c_aname) or {}
+            c_uids = self._extract_identifiers(c_cinfo) | {self._clean_user_id(c_aid), self._clean_user_id(c_aname)}
+            if (c_uids & owner_identifiers) or (c_uids & exempt_admin_set):
                 continue
 
             # コメントのタイムスタンプ記録
@@ -682,9 +879,9 @@ class SpamMonitorEngine:
             valid_ts = [t for t in timestamps if now - t <= 10.0]
             self.user_comment_timestamps[c_key] = valid_ts
 
-            if owner_id and c_key == owner_id:
-                continue
-            if c_key in exempt_admins:
+            c_cinfo = collab_map.get(c_key) or {}
+            c_ids = self._extract_identifiers(c_cinfo) | {self._clean_user_id(c_key)}
+            if (c_ids & owner_identifiers) or (c_ids & exempt_admin_set):
                 continue
 
             # 精密間隔判定: 1秒間に2件以上 または 2秒間に4件以上
@@ -702,7 +899,7 @@ class SpamMonitorEngine:
                     if anon_cid:
                         comments_to_delete.add(anon_cid)
 
-        # コメント違反者のアカウントの「投稿」と「コメント」だけを削除 (周りを巻き込まない)
+        # コメント違反者のアカウントの「投稿」と「コメント」だけを削除 (周りを巻き込まない & ボード作成者は絶対保護)
         if violating_comment_authors:
             for c in comments:
                 c_author = str(c.get("author_id", "") or "").strip()
@@ -710,16 +907,20 @@ class SpamMonitorEngine:
                     if c.get("id"):
                         comments_to_delete.add(str(c["id"]))
             for p in posts:
+                if self._is_owner_post(p, owner_identifiers, collab_map):
+                    continue  # ボード作成者は絶対に保護
                 p_author = str(p.get("author_id", "") or "").strip()
                 if p_author and p_author != "anonymous" and p_author in violating_comment_authors:
                     if p.get("id"):
                         posts_to_delete.add(str(p["id"]))
 
         # -------------------------------------------------------------
-        # 荒らしに検知した人の投稿は「絶対にすべて削除」
+        # 荒らしに検知した人の投稿は「絶対にすべて削除」 (ボード作成者は絶対に保護)
         # -------------------------------------------------------------
         if spammer_uids_to_punish:
             for p in posts:
+                if self._is_owner_post(p, owner_identifiers, collab_map):
+                    continue  # ボード作成者は絶対に保護
                 p_aid = str(p.get("author_id", "") or "").strip()
                 if p_aid and p_aid != "anonymous" and p_aid in spammer_uids_to_punish and p.get("id"):
                     posts_to_delete.add(str(p["id"]))
@@ -727,6 +928,10 @@ class SpamMonitorEngine:
                 c_aid = str(c.get("author_id", "") or "").strip()
                 if c_aid and c_aid != "anonymous" and c_aid in spammer_uids_to_punish and c.get("id"):
                     comments_to_delete.add(str(c["id"]))
+
+        # ボード作成者の投稿は posts_to_delete から物理的に除外（安全二重ガード）
+        owner_post_ids = {str(p.get("id")) for p in posts if self._is_owner_post(p, owner_identifiers, collab_map)}
+        posts_to_delete = {pid for pid in posts_to_delete if pid not in owner_post_ids}
 
         # 既知投稿ID・コメントIDの安全更新 (クリアせず追記蓄積)
         if current_post_ids:
@@ -747,25 +952,32 @@ class SpamMonitorEngine:
             if new_spammers or new_posts_to_del or new_comments_to_del:
                 threading.Thread(
                     target=self._handle_spammers_batch,
-                    args=(main_wall_id, main_wall_hashid, new_spammers, new_posts_to_del, new_comments_to_del, dict(collab_map), expected_visitor_role),
+                    args=(main_wall_id, main_wall_hashid, new_spammers, new_posts_to_del, new_comments_to_del, dict(collab_map), expected_visitor_role, set(owner_identifiers)),
                     daemon=True
                 ).start()
 
-    def _handle_spammers_batch(self, main_wall_id: int, main_wall_hashid: str, spammer_ids: Set[str], posts_to_delete: Set[str], comments_to_delete: Set[str], collab_map: Dict[str, Any], expected_visitor_role: str):
+    def _handle_spammers_batch(self, main_wall_id: int, main_wall_hashid: str, spammer_ids: Set[str], posts_to_delete: Set[str], comments_to_delete: Set[str], collab_map: Dict[str, Any], expected_visitor_role: str, owner_identifiers: Optional[Set[str]] = None):
         """
         荒らしアカウント群の一括迅速処罰 & 投稿・コメント削除 & 再確認
         【高速化】ThreadPoolExecutor により20人同時荒らしでも0.5秒以内に全員降格＆全削除
-        ※無実の一般ユーザー・コラボレーターを絶対に巻き込まない安全設計
+        ※ボード作成者(owner)の投稿・コメントは絶対に削除しない完全保護設計
         """
         try:
+            if owner_identifiers is None:
+                owner_identifiers = set()
+
             # 1. 全体権限の確認 & 設定値への即座固定
             curr_settings = self.client.get_access_settings(main_wall_hashid)
             if curr_settings.get("visitorRole") != expected_visitor_role:
                 self.client.change_visitor_role(main_wall_hashid, expected_visitor_role, wall_id=main_wall_id)
 
             # 2. 荒らしアカウント全員をコラボレーターから削除せず、「読者(reader)」に設定・降格 (並列一括実行)
+            # ※ボード作成者は絶対に処罰対象に含めない
             demoted_count = 0
-            spammer_list = [sid for sid in spammer_ids if sid and sid != "anonymous"]
+            spammer_list = [
+                sid for sid in spammer_ids
+                if sid and sid != "anonymous" and self._clean_user_id(sid) not in owner_identifiers
+            ]
             if spammer_list:
                 def _demote_user(uid):
                     try:
@@ -785,29 +997,37 @@ class SpamMonitorEngine:
                             demoted_count += 1
 
             # 荒らしアカウントに関連する識別子 (UID, hashid, 固有username)
-            # ※表示名(name)や汎用名(Unknown, anonymous等)での照合は他人の誤削除を引き起こすため絶対に含めない！
             spammer_all_identifiers: Set[str] = set()
             for sid in spammer_list:
-                spammer_all_identifiers.add(str(sid).strip())
-                cinfo = collab_map.get(sid, {})
-                hid = str(cinfo.get("hashid") or "").strip()
-                if hid:
-                    spammer_all_identifiers.add(hid)
-                uname = str(cinfo.get("username") or "").strip().lower()
-                if uname and uname not in ("unknown", "anonymous", "", "guest", "none"):
-                    spammer_all_identifiers.add(uname)
+                clean_sid = self._clean_user_id(sid)
+                if clean_sid not in owner_identifiers:
+                    spammer_all_identifiers.add(clean_sid)
+                    spammer_all_identifiers.add(str(sid).strip())
+                    cinfo = collab_map.get(sid, {})
+                    hid = str(cinfo.get("hashid") or "").strip()
+                    if hid:
+                        spammer_all_identifiers.add(hid)
+                        spammer_all_identifiers.add(self._clean_user_id(hid))
+                    uname = str(cinfo.get("username") or "").strip().lower()
+                    if uname and uname not in ("unknown", "anonymous", "", "guest", "none"):
+                        spammer_all_identifiers.add(uname)
+                        spammer_all_identifiers.add(self._clean_user_id(uname))
 
-            # 3. 投稿の並列一括削除 (荒らし検知者の投稿は絶対にすべて削除)
+            # 3. 投稿の並列一括削除 (ボード作成者の投稿は絶対に削除しない！)
             all_posts = self.client.get_posts(main_wall_hashid)
             for p in all_posts:
-                p_aid = str(p.get("author_id", "") or "").strip()
-                p_aname = str(p.get("author_name", "") or "").strip().lower()
+                if self._is_owner_post(p, owner_identifiers, collab_map):
+                    continue  # ボード作成者の投稿は絶対に保護
+                p_aid = self._clean_user_id(p.get("author_id"))
+                p_aname = self._clean_user_id(p.get("author_name"))
                 is_spammer_post = (p_aid and p_aid != "anonymous" and p_aid in spammer_all_identifiers) or \
                                   (p_aname and p_aname not in ("unknown", "anonymous", "", "guest") and p_aname in spammer_all_identifiers)
                 if is_spammer_post and p.get("id"):
                     posts_to_delete.add(str(p["id"]))
 
-            delete_list = list(posts_to_delete)
+            # ボード作成者の投稿を安全二重除外
+            owner_pids = {str(p.get("id")) for p in all_posts if self._is_owner_post(p, owner_identifiers, collab_map)}
+            delete_list = [pid for pid in posts_to_delete if pid not in owner_pids]
             deleted_count = 0
             if delete_list:
                 def _delete_p(pid):
@@ -822,12 +1042,17 @@ class SpamMonitorEngine:
                         if f.result():
                             deleted_count += 1
 
-            # 4. コメントの並列一括削除 (荒らし検知者のコメントは絶対にすべて削除)
+            # 4. コメントの並列一括削除 (ボード作成者のコメントは保護)
             comments = self.client.get_comments(main_wall_hashid)
             for c in comments:
-                c_aid = str(c.get("author_id", "") or "").strip()
-                c_aname = str(c.get("author_name", "") or "").strip().lower()
+                c_aid = self._clean_user_id(c.get("author_id"))
+                c_aname = self._clean_user_id(c.get("author_name"))
                 cid = str(c.get("id", "") or "").strip()
+                if (c_aid and c_aid in owner_identifiers) or (c_aname and c_aname in owner_identifiers):
+                    if cid in comments_to_delete:
+                        comments_to_delete.remove(cid)
+                    continue
+
                 is_spammer_comment = (c_aid and c_aid != "anonymous" and c_aid in spammer_all_identifiers) or \
                                      (c_aname and c_aname not in ("unknown", "anonymous", "", "guest") and c_aname in spammer_all_identifiers)
                 if (is_spammer_comment or cid in comments_to_delete) and cid:
@@ -848,13 +1073,15 @@ class SpamMonitorEngine:
                         if f.result():
                             deleted_comments_count += 1
 
-            # 5. 【再確認 (ダブルチェック)】: 削除後に荒らし投稿・コメントが残存していないか確認
+            # 5. 【再確認 (ダブルチェック)】: 削除後に荒らし投稿・コメントが残存していないか確認 (ボード作成者は保護)
             time.sleep(0.3)
             verify_posts = self.client.get_posts(main_wall_hashid)
             remaining_spams = [
                 p for p in verify_posts
-                if str(p.get("id")) in posts_to_delete or
-                   (str(p.get("author_id", "")).strip() != "anonymous" and str(p.get("author_id", "")).strip() in spammer_all_identifiers)
+                if not self._is_owner_post(p, owner_identifiers, collab_map) and (
+                    str(p.get("id")) in delete_list or
+                    (self._clean_user_id(p.get("author_id")) != "anonymous" and self._clean_user_id(p.get("author_id")) in spammer_all_identifiers)
+                )
             ]
             if remaining_spams:
                 for rp in remaining_spams:
@@ -867,8 +1094,10 @@ class SpamMonitorEngine:
             verify_comments = self.client.get_comments(main_wall_hashid)
             remaining_c_spams = [
                 c for c in verify_comments
-                if str(c.get("id", "")).strip() in comments_to_delete or
-                   (str(c.get("author_id", "")).strip() != "anonymous" and str(c.get("author_id", "")).strip() in spammer_all_identifiers)
+                if (self._clean_user_id(c.get("author_id")) not in owner_identifiers) and (
+                    str(c.get("id", "")).strip() in c_delete_list or
+                    (self._clean_user_id(c.get("author_id")) != "anonymous" and self._clean_user_id(c.get("author_id")) in spammer_all_identifiers)
+                )
             ]
             if remaining_c_spams:
                 for rc in remaining_c_spams:
@@ -986,8 +1215,25 @@ class SpamMonitorEngine:
                     self.is_restoring = False
                     return
 
+                # ボード作成者(owner / creator)の包括的識別子セットの構築 (プロフィールのユーザーIDにも完全対応)
+                owner_identifiers: Set[str] = set()
+                if owner_id:
+                    owner_identifiers.add(self._clean_user_id(owner_id))
+                main_board_info = data.get("main_board", {})
+                for k in ("owner_id", "builder_id", "creator_id", "owner_username", "username"):
+                    v = main_board_info.get(k)
+                    if v:
+                        owner_identifiers.add(self._clean_user_id(v))
+                if getattr(self.client, "owner_id", None):
+                    owner_identifiers.add(self._clean_user_id(self.client.owner_id))
+                for uid, cinfo in collab_map.items():
+                    role = (cinfo.get("role") or "").lower()
+                    if role in ("owner", "builder") or cinfo.get("is_owner"):
+                        owner_identifiers.update(self._extract_identifiers(cinfo))
+
                 # ステップ2: 【正常な投稿の事前保護】
                 # メインボードに現在存在する投稿を取得し、荒らしに検知されていない正常な投稿を特定・保護
+                # ※ボード作成者の投稿は無条件で絶対に保護！
                 # ※タイトルおよび本文には文字数制限なし（無制限）、画像キャプション制限のみ適用
                 raw_caption_limit = data.get("max_caption_length", data.get("max_post_length", 50))
                 try:
@@ -998,13 +1244,19 @@ class SpamMonitorEngine:
                 main_posts_before = self.client.get_posts(main_wall_hashid)
                 safe_main_posts = []
                 for mp in main_posts_before:
-                    caption = str(mp.get("attachment_caption") or "").strip()
+                    # ボード作成者の投稿は最優先で無条件完全保護！
+                    if self._is_owner_post(mp, owner_identifiers, collab_map):
+                        safe_main_posts.append(mp)
+                        continue
+
                     # キャプション文字数制限以上の明らかな荒らし投稿のみ除外
+                    caption = str(mp.get("attachment_caption") or "").strip()
                     if max_caption_len > 0 and len(caption) >= max_caption_len:
                         continue
+
                     safe_main_posts.append(mp)
 
-                self.add_log("RECOVERY", f"【フェーズ2】正常な投稿{len(safe_main_posts)}件を保護対象として認識しました (タイトル・本文無制限)")
+                self.add_log("RECOVERY", f"【フェーズ2】正常な投稿{len(safe_main_posts)}件を保護対象として認識しました (ボード作成者投稿完全保護・タイトル/本文無制限)")
 
                 # ステップ3: 【必ずセクションを全部削除】
                 self.add_log("RECOVERY", "【フェーズ3】メインボードの既存セクションを全部確実に削除中...")
@@ -1066,11 +1318,12 @@ class SpamMonitorEngine:
                 # ステップ5: 【バックアップから投稿を復元 & 正常投稿の保護】
                 self.add_log("RECOVERY", f"【フェーズ5】バックアップから投稿を復元中... (対象: {len(backup_posts)}件)")
                 
-                # 既にメインボードに存在する投稿のフィンガープリント
-                existing_fps = {f"{str(p.get('subject', ''))}:::{str(p.get('content', ''))}" for p in safe_main_posts}
+                # セクション削除後に現在メインボードに残っている投稿のフィンガープリント
+                current_existing_posts = self.client.get_posts(main_wall_hashid)
+                existing_fps = {f"{str(p.get('subject', ''))}:::{str(p.get('content', ''))}" for p in current_existing_posts}
 
                 restored_posts_count = 0
-                def _copy_single_post(bp):
+                def _copy_single_post(bp, default_sec_id=None):
                     subject = str(bp.get("subject", "") or "")
                     content = str(bp.get("content", "") or "")
                     attachment = bp.get("attachment")
@@ -1088,7 +1341,7 @@ class SpamMonitorEngine:
                     if b_sec_id:
                         target_sec_id = section_id_map.get(str(b_sec_id))
                     if not target_sec_id:
-                        target_sec_id = first_created_sec_id
+                        target_sec_id = default_sec_id or first_created_sec_id
 
                     ok = self.client.create_post(
                         wall_id=main_wall_id,
@@ -1101,14 +1354,28 @@ class SpamMonitorEngine:
                         custom_key=data.get("custom_key"),
                         custom_value=data.get("custom_value")
                     )
+                    if ok:
+                        existing_fps.add(fp)
                     return ok
 
+                # (A) バックアップ投稿の復元
                 with ThreadPoolExecutor(max_workers=5) as post_executor:
                     futures = [post_executor.submit(_copy_single_post, bp) for bp in backup_posts]
                     for f in as_completed(futures):
                         try:
                             if f.result():
                                 restored_posts_count += 1
+                        except Exception:
+                            pass
+
+                # (B) セクション削除で消えてしまった正常投稿・ボード作成者投稿も復元
+                safe_restored_count = 0
+                with ThreadPoolExecutor(max_workers=5) as post_executor:
+                    futures = [post_executor.submit(_copy_single_post, sp, first_created_sec_id) for sp in safe_main_posts]
+                    for f in as_completed(futures):
+                        try:
+                            if f.result():
+                                safe_restored_count += 1
                         except Exception:
                             pass
 

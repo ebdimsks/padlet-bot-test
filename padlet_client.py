@@ -337,6 +337,25 @@ class PadletClient:
 
                     custom_props = attrs.get("custom_properties")
 
+                    # ピン留め (pinned) 属性の包括的検知
+                    pos_str = str(attrs.get("position", "") or "").lower()
+                    is_pinned = bool(
+                        attrs.get("pinned") or
+                        attrs.get("is_pinned") or
+                        attrs.get("isPinned") or
+                        attrs.get("pin") or
+                        attrs.get("pinned_at") or
+                        pos_str == "pinned" or
+                        pos_str == "pin" or
+                        item.get("pinned") or
+                        item.get("is_pinned") or
+                        (isinstance(custom_props, dict) and (
+                            custom_props.get("pinned") or
+                            custom_props.get("is_pinned") or
+                            custom_props.get("pin")
+                        ))
+                    )
+
                     posts.append({
                         "id": str(item.get("id")),
                         "subject": subject_text,
@@ -347,7 +366,8 @@ class PadletClient:
                         "attachment_caption": attachment_caption.strip(),
                         "section_id": str(attrs.get("wall_section_id", "")) if attrs.get("wall_section_id") else None,
                         "custom_properties": custom_props if isinstance(custom_props, dict) else None,
-                        "created_at": attrs.get("created_at")
+                        "created_at": attrs.get("created_at"),
+                        "pinned": is_pinned
                     })
 
                 if len(data) < limit:
@@ -680,22 +700,31 @@ class PadletClient:
 
     def change_user_role(self, wall_id: int, user_id: str, role: str = "reader", board_hashid: Optional[str] = None) -> bool:
         """
-        荒らしアカウントをコラボレーターから削除せず、確実に「読者 (reader)」に設定・固定する。
-        既存コラボレーターの権限変更(PATCH)および未登録ユーザーの読者追加(POST)の両方に対応。
+        荒らしアカウントの読者降格、および免除アカウントの管理者/モデレーター復元。
+        プロフィールのユーザー名(@あり/なし)や数値ID、hashidのすべてに対応。
         """
         if not user_id or user_id == "anonymous":
             return False
 
-        # 1. 既存コラボレーターの権限変更 (PATCH) - 読者/指定ロールに降格
-        patch_urls = [
-            f"https://padlet.com/api/8/walls/{wall_id}/user-collaborators/{user_id}",
-            f"https://padlet.com/api/10/walls/{wall_id}/user-collaborators/{user_id}"
-        ]
-        if board_hashid:
+        raw_uid = str(user_id).strip()
+        clean_uid = raw_uid.lstrip("@").strip()
+        id_candidates = [raw_uid]
+        if clean_uid and clean_uid != raw_uid:
+            id_candidates.append(clean_uid)
+
+        # 1. 既存コラボレーターの権限変更 (PATCH)
+        patch_urls = []
+        for cand in id_candidates:
             patch_urls.extend([
-                f"https://padlet.com/api/8/walls/{board_hashid}/user-collaborators/{user_id}",
-                f"https://padlet.com/api/10/walls/{board_hashid}/user-collaborators/{user_id}"
+                f"https://padlet.com/api/8/walls/{wall_id}/user-collaborators/{cand}",
+                f"https://padlet.com/api/10/walls/{wall_id}/user-collaborators/{cand}"
             ])
+            if board_hashid:
+                patch_urls.extend([
+                    f"https://padlet.com/api/8/walls/{board_hashid}/user-collaborators/{cand}",
+                    f"https://padlet.com/api/10/walls/{board_hashid}/user-collaborators/{cand}"
+                ])
+
         for url in patch_urls:
             try:
                 res = self.request('PATCH', url, json={"role": role}, timeout=5)
@@ -704,16 +733,17 @@ class PadletClient:
             except Exception:
                 pass
 
-        # 2. まだコラボレーターにいない場合は、読者(reader)としてコラボレーターに追加・登録 (POST)
-        # コラボレーターから削除するのではなく、読者としてコラボレーター内に縛り付けて投稿を物理的に封殺
+        # 2. まだコラボレーターにいない場合は、指定権限としてコラボレーターに追加・登録 (POST)
         post_urls = [
             f"https://padlet.com/api/8/walls/{wall_id}/user-collaborators",
             f"https://padlet.com/api/10/walls/{wall_id}/user-collaborators"
         ]
         post_payloads = [
-            {"user_id": user_id, "role": role},
-            {"userId": user_id, "role": role},
-            {"user_id": int(user_id) if str(user_id).isdigit() else user_id, "role": role}
+            {"user_id": clean_uid, "role": role},
+            {"userId": clean_uid, "role": role},
+            {"username": clean_uid, "role": role},
+            {"user": clean_uid, "role": role},
+            {"user_id": int(clean_uid) if clean_uid.isdigit() else clean_uid, "role": role}
         ]
         for url in post_urls:
             for p in post_payloads:
