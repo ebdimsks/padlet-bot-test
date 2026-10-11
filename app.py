@@ -153,7 +153,8 @@ def load_config() -> dict:
             _config_cache.setdefault("block_duplicates", True)
             _config_cache.setdefault("block_image_repeat", True)
             _config_cache.setdefault("block_urls", False)
-            _config_cache.setdefault("max_post_length", 500)
+            _config_cache.setdefault("max_caption_length", 50)  # 画像キャプション最大文字数制限 (超過で投稿のみ削除、タイトル・本文は無制限)
+            _config_cache.setdefault("max_post_length", 50)  # 後方互換キー
             _config_cache.setdefault("random_str_pattern", r"^.+_[a-zA-Z0-9]{4,}$")
         return _config_cache
 
@@ -249,10 +250,15 @@ def api_save_config():
         "notification_section_id", "notification_section_title", "custom_key", "custom_value",
         "allowed_admins", "allowed_moderators", "exempt_admins",
         "max_sections", "poll_interval_seconds", "default_visitor_role", "ddos_threshold",
-        "delete_non_collaborators", "block_duplicates", "block_image_repeat", "block_urls", "max_post_length", "random_str_pattern"
+        "delete_non_collaborators", "block_duplicates", "block_image_repeat", "block_urls", "max_caption_length", "max_post_length", "random_str_pattern"
     ]:
         if key in data:
             cfg[key] = data[key]
+
+    if "max_caption_length" in data:
+        cfg["max_post_length"] = data["max_caption_length"]
+    elif "max_post_length" in data:
+        cfg["max_caption_length"] = data["max_post_length"]
 
     save_config()
     add_log("CONFIG", "設定が更新されました")

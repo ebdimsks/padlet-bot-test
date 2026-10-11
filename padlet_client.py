@@ -686,11 +686,16 @@ class PadletClient:
         if not user_id or user_id == "anonymous":
             return False
 
-        # 1. 既存コラボレーターの権限変更 (PATCH) - 読者に降格
+        # 1. 既存コラボレーターの権限変更 (PATCH) - 読者/指定ロールに降格
         patch_urls = [
             f"https://padlet.com/api/8/walls/{wall_id}/user-collaborators/{user_id}",
             f"https://padlet.com/api/10/walls/{wall_id}/user-collaborators/{user_id}"
         ]
+        if board_hashid:
+            patch_urls.extend([
+                f"https://padlet.com/api/8/walls/{board_hashid}/user-collaborators/{user_id}",
+                f"https://padlet.com/api/10/walls/{board_hashid}/user-collaborators/{user_id}"
+            ])
         for url in patch_urls:
             try:
                 res = self.request('PATCH', url, json={"role": role}, timeout=5)

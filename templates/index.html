@@ -447,7 +447,7 @@
 
         <div class="checkbox-group">
           <input type="checkbox" id="blockImageRepeat" checked>
-          <label for="blockImageRepeat">同一画像の短期間連投検知 (その人のみ読者降格＆全投稿削除) ＆ 画像キャプション50文字以上の投稿削除</label>
+          <label for="blockImageRepeat">同一画像の短期間連投検知 (その人のみ読者降格＆全投稿削除)</label>
         </div>
 
         <div class="checkbox-group">
@@ -456,8 +456,9 @@
         </div>
 
         <div class="form-group" style="margin-top: 10px;">
-          <label>1投稿の最大文字数制限 (超過で即削除＆読者降格、0で無効)</label>
-          <input type="number" id="maxPostLength" value="500" min="0" max="10000">
+          <label for="maxCaptionLength">画像キャプションの最大文字数制限 (超過で投稿のみ削除、デフォルト50文字、0で無効)</label>
+          <input type="number" id="maxCaptionLength" value="50" min="0" max="10000">
+          <small style="color: var(--text-muted);">※タイトルおよび本文には文字数制限はありません。画像のキャプションのみを判定・削除します。</small>
         </div>
 
         <div class="form-group" style="margin-top: 14px;">
@@ -541,7 +542,7 @@
         document.getElementById('blockDuplicates').checked = !!appConfig.block_duplicates;
         document.getElementById('blockImageRepeat').checked = !!appConfig.block_image_repeat;
         document.getElementById('blockUrls').checked = !!appConfig.block_urls;
-        document.getElementById('maxPostLength').value = appConfig.max_post_length ?? 500;
+        document.getElementById('maxCaptionLength').value = appConfig.max_caption_length ?? appConfig.max_post_length ?? 50;
         document.getElementById('regexPattern').value = appConfig.random_str_pattern || '^.+_[a-zA-Z0-9]{4,}$';
 
         tagData.admins = appConfig.allowed_admins || [];
@@ -748,7 +749,8 @@
           block_duplicates: document.getElementById('blockDuplicates').checked,
           block_image_repeat: document.getElementById('blockImageRepeat').checked,
           block_urls: document.getElementById('blockUrls').checked,
-          max_post_length: parseInt(document.getElementById('maxPostLength').value, 10),
+          max_caption_length: parseInt(document.getElementById('maxCaptionLength').value, 10),
+          max_post_length: parseInt(document.getElementById('maxCaptionLength').value, 10),
           random_str_pattern: document.getElementById('regexPattern').value
         })
       });

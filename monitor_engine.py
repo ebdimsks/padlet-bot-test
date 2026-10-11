@@ -235,6 +235,74 @@ class SpamMonitorEngine:
             # 高速かつ安全なポーリング待機 (最小0.5秒)
             time.sleep(max(float(self.get_data().get("poll_interval_seconds", 1.0)), 0.5))
 
+    def _demote_unauthorized_admins_and_mods(self, main_wall_id: int, main_wall_hashid: str, collab_map: Dict[str, Any], owner_id: Optional[str], exempt_admins: Set[str]) -> List[str]:
+        """
+        セクション荒らし検知時: 降格免除リスト(exempt_admins)および部屋主(owner_id)以外の
+        すべての管理者(admin/owner)とモデレーター(moderator)の権限を確実に writer に降格する。
+        """
+        # 最新のコラボレーター情報を再取得して統合
+        latest_collabs = self.client.get_collaborators(main_wall_hashid, main_wall_id)
+        current_map = dict(collab_map)
+        for c in latest_collabs:
+            uid = c.get("user_id")
+            if uid and uid != "anonymous":
+                current_map[uid] = c
+
+        exempt_lower = {str(x).strip().lower() for x in exempt_admins if str(x).strip()}
+        owner_str = str(owner_id).strip().lower() if owner_id else ""
+
+        targets = []
+        for uid, cinfo in current_map.items():
+            uid_str = str(uid).strip()
+            if not uid_str or uid_str == "anonymous":
+                continue
+            if owner_str and uid_str.lower() == owner_str:
+                continue
+
+            username = str(cinfo.get("username") or "").strip()
+            name = str(cinfo.get("name") or "").strip()
+            hashid = str(cinfo.get("hashid") or "").strip()
+            role = str(cinfo.get("role") or "").strip().lower()
+
+            # 降格免除リスト判定 (UID, username, name, hashid のいずれかが一致すれば免除・保護)
+            if (uid_str.lower() in exempt_lower or
+                (username and username.lower() in exempt_lower) or
+                (name and name.lower() in exempt_lower) or
+                (hashid and hashid.lower() in exempt_lower)):
+                continue
+
+            # 管理者・モデレーターのみを対象として writer に降格
+            if role in ("admin", "owner", "moderator"):
+                targets.append((uid_str, hashid, username or name or uid_str, role))
+
+        demoted_names = []
+        if targets:
+            def _demote_single(target):
+                u_id, h_id, uname, old_role = target
+                success = False
+                # user_id で降格試行
+                if self.client.change_user_role(main_wall_id, u_id, "writer", board_hashid=main_wall_hashid):
+                    success = True
+                # hashid でも試行
+                elif h_id and self.client.change_user_role(main_wall_id, h_id, "writer", board_hashid=main_wall_hashid):
+                    success = True
+
+                if success:
+                    self.add_log("SECURITY", f"セクション荒らし防衛降格: {uname} (ID: {u_id}, {old_role} ➜ writer)")
+                    return uname
+                else:
+                    self.add_log("WARN", f"管理者降格試行完了: {uname} (ID: {u_id})")
+                    return uname
+
+            with ThreadPoolExecutor(max_workers=min(max(len(targets), 4), 16)) as executor:
+                futures = [executor.submit(_demote_single, t) for t in targets]
+                for f in as_completed(futures):
+                    res = f.result()
+                    if res:
+                        demoted_names.append(res)
+
+        return demoted_names
+
     def _check_cycle(self, data: Dict[str, Any], main_wall_id: int, main_wall_hashid: str):
         """1サイクルの包括的防衛チェック (セクション荒らし・投稿荒らし・コメント違反の精密対処)"""
         now = time.time()
@@ -340,26 +408,35 @@ class SpamMonitorEngine:
                     self.send_discord_webhook("不正モデレーター検知・即時降格", msg, color=0xFFA500)
 
         # =====================================================================
-        # 3. セクション増殖荒らしの検知 & 自動復旧起動
+        # 3. セクション増殖荒らしの検知 & 自動防衛・管理者降格 & 自動復旧起動
         # =====================================================================
         max_sections = int(data.get("max_sections", 10))
         current_sections = self.client.get_sections(main_wall_id)
         if len(current_sections) > max_sections and not self.is_restoring:
             alert_msg = f"セクション数異常増殖を検知 (現在: {len(current_sections)}個 / 上限: {max_sections}個)！"
             self.add_log("ALERT", "🚨 セクション荒らし検知！", alert_msg)
-            # 全体権限をロックダウン
+
+            # (1) 全体権限を即時ロックダウン
             self.client.change_visitor_role(main_wall_hashid, "reader", wall_id=main_wall_id)
+
+            # (2) 降格免除リスト以外の管理者・モデレーターの権限をしっかり下げる (writer に降格)
+            demoted_admins = self._demote_unauthorized_admins_and_mods(
+                main_wall_id, main_wall_hashid, collab_map, owner_id, exempt_admins
+            )
+            demoted_str = ", ".join(demoted_admins) if demoted_admins else "なし"
+
             self.send_discord_webhook(
-                "🚨 セクション荒らし検知・即時防衛発動！",
-                f"{alert_msg}\n全体権限を即時ロックダウンし、全セクション削除＆バックアップ完全復元シーケンスを開始します。",
+                "🚨 セクション荒らし検知・即時防衛＆管理者降格発動！",
+                f"{alert_msg}\n全体権限を即時ロックダウンし、降格免除リスト以外の管理者・モデレーターを writer に降格しました。\n全セクション削除＆バックアップ完全復元シーケンスを開始します。",
                 color=0xFF0000,
                 fields=[
                     {"name": "検知セクション数", "value": f"{len(current_sections)} 個 (上限: {max_sections})", "inline": True},
-                    {"name": "防衛ステータス", "value": "全体権限ロック ➜ バックアップ完全復元中", "inline": True}
+                    {"name": "降格された管理者/モデレーター", "value": f"`{demoted_str}`", "inline": True},
+                    {"name": "防衛ステータス", "value": "管理者降格 ➜ 全体権限ロック ➜ バックアップ完全復元中", "inline": False}
                 ],
                 mention_everyone=True
             )
-            # バックグラウンドスレッドで復元を実行
+            # (3) バックグラウンドスレッドで復元を実行
             self.execute_section_recovery(main_wall_id, main_wall_hashid, current_sections, collab_map, owner_id)
 
         # =====================================================================
@@ -522,10 +599,17 @@ class SpamMonitorEngine:
 
         # -------------------------------------------------------------
         # 【読者にはしないけど、投稿を削除するやつ】
-        # ① 画像のキャプションのところが50文字以上の投稿
+        # ① 画像のキャプションのところが文字数制限(デフォルト50文字)以上の投稿
+        #    ※タイトルおよび本文には文字数制限なし（無制限）
         # ② コラボレーター以外の投稿
-        # ※「全体の権限がライターの場合は、コラボレーターにいなくても、投稿は消さない」
+        #    ※「全体の権限がライターの場合は、コラボレーターにいなくても、投稿は消さない」
         # -------------------------------------------------------------
+        raw_caption_limit = data.get("max_caption_length", data.get("max_post_length", 50))
+        try:
+            max_caption_len = int(raw_caption_limit)
+        except Exception:
+            max_caption_len = 50
+
         for p in posts:
             pid = str(p.get("id", ""))
             aid = str(p.get("author_id", "") or "").strip()
@@ -541,12 +625,14 @@ class SpamMonitorEngine:
             if fp in self.protected_post_fingerprints or (p.get("subject") or "").startswith("🛡️ [防衛通知]"):
                 continue
 
-            # ① 画像キャプションが50文字以上 -> 投稿のみ削除 (読者にはしない)
-            caption = str(p.get("attachment_caption") or "").strip()
-            if len(caption) >= 50:
-                posts_to_delete.add(pid)
-                self.add_log("DEFENSE", f"画像キャプション50文字以上の投稿を削除: {len(caption)}文字 (PostID: {pid})")
-                continue
+            # ① 画像キャプションが制限(デフォルト50文字)以上 -> 投稿のみ削除 (読者にはしない)
+            # ※タイトルおよび本文には文字数制限はありません（無制限）
+            if max_caption_len > 0:
+                caption = str(p.get("attachment_caption") or "").strip()
+                if len(caption) >= max_caption_len:
+                    posts_to_delete.add(pid)
+                    self.add_log("DEFENSE", f"画像キャプション文字数超過({max_caption_len}文字以上)の投稿を削除: {len(caption)}文字 (PostID: {pid})")
+                    continue
 
             # ② コラボレーター以外の投稿 -> 投稿のみ削除 (読者にはしない)
             # ※「全体の権限がライターの場合は、コラボレーターにいなくても、投稿は消さない」
@@ -872,10 +958,17 @@ class SpamMonitorEngine:
                 backup_wall_hashid = backup_board.get("wall_hashid")
                 expected_visitor_role = data.get("default_visitor_role", "commenter")
 
-                # ステップ1: 全体権限の一時緊急ロックダウン (荒らしの追加介入を防止)
-                # ※注意: 荒らしではないコラボレーターの権限は絶対に下げない (指示遵守)
-                self.add_log("RECOVERY", "【フェーズ1】全体権限の一時緊急ロックダウン開始 (コラボレーター権限は完全保護)")
+                # ステップ1: 全体権限の一時緊急ロックダウン & 降格免除リスト以外の管理者・モデレーター降格
+                self.add_log("RECOVERY", "【フェーズ1】全体権限の緊急ロックダウン & 降格免除リスト以外の管理者/モデレーター降格実行")
                 self.client.change_visitor_role(main_wall_hashid, "reader", wall_id=main_wall_id)
+
+                # 降格免除リスト以外の管理者・モデレーターを確実に writer に降格
+                exempt_admins = set(str(x) for x in data.get("exempt_admins", []))
+                demoted_admins = self._demote_unauthorized_admins_and_mods(
+                    main_wall_id, main_wall_hashid, collab_map, owner_id, exempt_admins
+                )
+                if demoted_admins:
+                    self.add_log("SECURITY", f"セクション復旧前防衛: {len(demoted_admins)}名の管理者/モデレーターを writer に降格しました ({', '.join(demoted_admins)})")
 
                 if not backup_wall_id or not backup_wall_hashid:
                     self.add_log("WARN", "バックアップボード情報が未設定のため、復元を中止し権限を戻します")
@@ -895,16 +988,23 @@ class SpamMonitorEngine:
 
                 # ステップ2: 【正常な投稿の事前保護】
                 # メインボードに現在存在する投稿を取得し、荒らしに検知されていない正常な投稿を特定・保護
+                # ※タイトルおよび本文には文字数制限なし（無制限）、画像キャプション制限のみ適用
+                raw_caption_limit = data.get("max_caption_length", data.get("max_post_length", 50))
+                try:
+                    max_caption_len = int(raw_caption_limit)
+                except Exception:
+                    max_caption_len = 50
+
                 main_posts_before = self.client.get_posts(main_wall_hashid)
                 safe_main_posts = []
                 for mp in main_posts_before:
                     caption = str(mp.get("attachment_caption") or "").strip()
-                    # キャプション50文字以上の明らかな荒らし投稿は除外
-                    if len(caption) >= 50:
+                    # キャプション文字数制限以上の明らかな荒らし投稿のみ除外
+                    if max_caption_len > 0 and len(caption) >= max_caption_len:
                         continue
                     safe_main_posts.append(mp)
 
-                self.add_log("RECOVERY", f"【フェーズ2】正常な投稿{len(safe_main_posts)}件を保護対象として認識しました")
+                self.add_log("RECOVERY", f"【フェーズ2】正常な投稿{len(safe_main_posts)}件を保護対象として認識しました (タイトル・本文無制限)")
 
                 # ステップ3: 【必ずセクションを全部削除】
                 self.add_log("RECOVERY", "【フェーズ3】メインボードの既存セクションを全部確実に削除中...")
@@ -1046,7 +1146,7 @@ class SpamMonitorEngine:
                         {"name": "📝 復元された投稿数", "value": f"{restored_posts_count} 件 / {len(backup_posts)} 件", "inline": True},
                         {"name": "🔍 整合性ダブルチェック", "value": "合格 (完全一致)" if is_correct else "一部要確認", "inline": True},
                         {"name": "🔔 通知セクション更新", "value": f"新IDに自動上書き済 ({orig_notif_title})", "inline": True},
-                        {"name": "🛡️ コラボレーター保護", "value": "荒らし以外の権限は一切変更せず保護", "inline": False}
+                        {"name": "🛡️ 権限防衛・コラボレーター保護", "value": "降格免除リスト以外の管理者/モデレーターを writer に降格・一般コラボレーターは保護", "inline": False}
                     ],
                     mention_everyone=True
                 )
