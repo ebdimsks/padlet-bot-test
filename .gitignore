@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local environment & secret files (絶対にGitHubに公開しない)
+.env
+bot_config.json
+.session_secret
+.generated_admin_password
+*.secret
+*.log
+
+# Temp files
+*.tmp
+
+# IDE / Editor
+.vscode/
+.idea/

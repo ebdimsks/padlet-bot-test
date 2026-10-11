@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Padlet 荒らし対策Bot 管理パネル</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card-bg: #1e293b;
+      --border: #334155;
+      --accent: #38bdf8;
+      --accent-hover: #0284c7;
+      --danger: #ef4444;
+      --danger-hover: #dc2626;
+      --success: #22c55e;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 20px;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 24px;
+    }
+
+    .title-area h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .status-badge {
+      font-size: 0.85rem;
+      padding: 4px 12px;
+      border-radius: 9999px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .status-badge.running { background: rgba(34, 197, 94, 0.2); color: #4ade80; border: 1px solid #22c55e; }
+    .status-badge.stopped { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid #ef4444; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    }
+
+    .card h2 {
+      font-size: 1.15rem;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: #e2e8f0;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .form-group {
+      margin-bottom: 14px;
+    }
+
+    label {
+      display: block;
+      font-size: 0.85rem;
+      font-weight: 500;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+
+    input[type="text"], input[type="password"], input[type="number"], textarea, select {
+      width: 100%;
+      padding: 10px 14px;
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.9rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    input:focus, textarea:focus {
+      border-color: var(--accent);
+    }
+
+    .checkbox-group {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .checkbox-group input {
+      width: 18px;
+      height: 18px;
+      cursor: pointer;
+      accent-color: var(--accent);
+    }
+    .checkbox-group label {
+      margin-bottom: 0;
+      cursor: pointer;
+      color: var(--text);
+    }
+
+    .btn {
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    .btn-primary { background: var(--accent); color: #0f172a; }
+    .btn-primary:hover { background: var(--accent-hover); }
+
+    .btn-danger { background: var(--danger); color: white; }
+    .btn-danger:hover { background: var(--danger-hover); }
+
+    .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    .btn-outline:hover { background: #334155; }
+
+    .board-preview {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      margin-top: 10px;
+      font-size: 0.85rem;
+    }
+    .board-preview h4 { color: var(--accent); margin-bottom: 4px; }
+
+    .tag-input-box {
+      background: #0f172a;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px;
+      min-height: 44px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .tag {
+      background: #334155;
+      color: var(--accent);
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .tag .remove {
+      cursor: pointer;
+      font-weight: bold;
+    }
+    .tag-input-box input {
+      border: none;
+      background: transparent;
+      padding: 4px;
+      flex-grow: 1;
+      color: var(--text);
+      min-width: 100px;
+    }
+
+    .log-container {
+      background: #090d16;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      height: 280px;
+      overflow-y: auto;
+      padding: 12px;
+      font-family: monospace;
+      font-size: 0.85rem;
+    }
+    .log-entry {
+      margin-bottom: 6px;
+      display: flex;
+      gap: 8px;
+    }
+    .log-time { color: var(--text-muted); }
+    .log-level { font-weight: bold; padding: 0 4px; border-radius: 3px; }
+    .log-level.ALERT { background: rgba(239, 68, 68, 0.3); color: #f87171; }
+    .log-level.DEFENSE { background: rgba(249, 115, 22, 0.3); color: #fb923c; }
+    .log-level.SUCCESS { background: rgba(34, 197, 94, 0.3); color: #4ade80; }
+    .log-level.SECURITY { background: rgba(168, 85, 247, 0.3); color: #c084fc; }
+    .log-level.INFO { color: #38bdf8; }
+
+    /* モーダル */
+    .modal-overlay {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0, 0, 0, 0.7);
+      backdrop-filter: blur(4px);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      z-index: 9999;
+    }
+    .modal-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      width: 100%;
+      max-width: 400px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ログインモーダル -->
+  <div id="loginModal" class="modal-overlay" style="display: none;">
+    <div class="modal-card">
+      <h2 style="margin-bottom: 16px;">🔐 パスワード認証</h2>
+      <div class="form-group">
+        <label>管理者パスワード</label>
+        <input type="password" id="loginPassword" placeholder="環境変数 ADMIN_PASSWORD の値">
+        <small style="color: var(--text-muted); display: block; margin-top: 5px;">
+          ※ 環境変数 <code>ADMIN_PASSWORD</code> で設定したパスワードを入力してください。<br>(未設定時はサーバー起動ログに表示された初期パスワード)
+        </small>
+      </div>
+      <button class="btn btn-primary" style="width: 100%;" onclick="submitLogin()">ログイン</button>
+      <div id="loginError" style="color: var(--danger); font-size: 0.85rem; margin-top: 10px;"></div>
+    </div>
+  </div>
+
+  <div class="container">
+    <header>
+      <div class="title-area">
+        <h1>🛡️ Padlet 荒らし対策Bot</h1>
+        <div style="font-size: 0.85rem; color: var(--text-muted);">Local / Railway 稼働中</div>
+      </div>
+      <div style="display: flex; gap: 12px; align-items: center;">
+        <span id="botStatusBadge" class="status-badge stopped">● 停止中</span>
+        <button id="toggleBotBtn" class="btn btn-primary" onclick="toggleBot()">監視開始</button>
+        <button class="btn btn-outline" style="border-color: #38bdf8; color: #38bdf8;" onclick="syncPosts()">📥 バックアップ投稿同期</button>
+        <button class="btn btn-danger" onclick="forceRecovery()">⚠️ 今すぐ完全復元</button>
+      </div>
+    </header>
+
+    <div class="grid">
+      <!-- 認証 & Discord連携 -->
+      <div class="card">
+        <h2>🔑 API & デュアルアカウント設定</h2>
+        <div class="form-group">
+          <label>Padlet 公式 API Key</label>
+          <input type="password" id="padletApiKey" placeholder="公式Developer画面で発行したAPI Key">
+          <small style="color: var(--text-muted);">ボード詳細の取得や投稿の作成に使用</small>
+        </div>
+        <div class="form-group">
+          <label>Padlet Session Token 1 (メインアカウント)</label>
+          <input type="password" id="padletSessionToken" placeholder="アカウント1のBearerトークン">
+        </div>
+        <div class="form-group">
+          <label>Padlet Session Token 2 (サブアカウント - レート制限分散用)</label>
+          <input type="password" id="padletSecondaryToken" placeholder="アカウント2のBearerトークン (2アカウント体制)">
+          <small style="color: var(--text-muted);">2個のアカウントを交互に使い、429制限を回避して超高速防衛</small>
+        </div>
+        <div class="form-group">
+          <label>Discord Webhook URL (リアルタイム通知)</label>
+          <input type="text" id="discordWebhook" placeholder="https://discord.com/api/webhooks/...">
+        </div>
+        <div class="form-group">
+          <label>監視間隔 (秒 - 推奨: 1.0秒で超高速監視)</label>
+          <input type="number" id="pollInterval" min="0.5" max="60" step="0.5" value="1.0">
+        </div>
+        <button class="btn btn-outline" style="width: 100%;" onclick="saveBasicConfig()">アカウント設定を保存</button>
+      </div>
+
+      <!-- メインボード設定 (URL自動解決) -->
+      <div class="card">
+        <h2>📌 メインボード (防衛対象)</h2>
+        <div class="form-group">
+          <label>メインボードのURL</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="mainBoardUrl" placeholder="https://padlet.com/username/xxxxxx">
+            <button class="btn btn-outline" onclick="resolveBoard('main')">取得</button>
+          </div>
+        </div>
+        <div id="mainBoardPreview" class="board-preview">
+          <div style="color: var(--text-muted);">URLを入力して「取得」を押すと自動解析されます</div>
+        </div>
+      </div>
+
+      <!-- バックアップボード設定 (URL自動解決) -->
+      <div class="card">
+        <h2>💾 バックアップボード (復元用)</h2>
+        <div class="form-group">
+          <label>バックアップボードのURL</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="backupBoardUrl" placeholder="https://padlet.com/username/xxxxxx">
+            <button class="btn btn-outline" onclick="resolveBoard('backup')">取得</button>
+          </div>
+        </div>
+        <div id="backupBoardPreview" class="board-preview">
+          <div style="color: var(--text-muted);">復元元のセクション・投稿データを持つボード</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <!-- 権限・セーフリスト設定 -->
+      <div class="card">
+        <h2>👥 管理者 & モデレーター保護設定</h2>
+        
+        <div class="form-group" style="background: rgba(56, 189, 248, 0.08); padding: 12px; border-radius: 8px; border: 1px solid rgba(56, 189, 248, 0.25); margin-bottom: 16px;">
+          <label style="color: var(--accent); font-weight: 600; font-size: 0.95rem;">🌐 部屋全体の権限 (URLを知っている人 / コラボレーター外の権限)</label>
+          <select id="defaultVisitorRole" style="font-size: 0.95rem; font-weight: 600; margin-top: 4px;">
+            <option value="none">🚫 アクセスなし / 非公開 (No Access - 完全遮断)</option>
+            <option value="reader">🔒 閲覧のみ (Reader - 推奨・投稿不可)</option>
+            <option value="writer">✏️ 投稿可能 (Writer - コラボレーター以外も書ける)</option>
+            <option value="moderator">🛡️ モデレーター (Moderator)</option>
+          </select>
+          <small style="color: var(--text-muted); display: block; margin-top: 6px;">
+            ※ 荒らしによって勝手に部屋全体の権限が「ライター」等に書き換えられた場合、Botが検知してこの設定値に即座に強制復旧させます。
+          </small>
+        </div>
+
+        <div class="form-group">
+          <label>許可された管理者 (ユーザーIDまたはユーザー名、Enterで追加)</label>
+          <div id="adminTags" class="tag-input-box" onclick="focusInput('adminTagInput')">
+            <input type="text" id="adminTagInput" onkeydown="handleTagInput(event, 'admins')">
+          </div>
+          <small style="color: var(--text-muted);">このリスト以外のアカウントが管理者になった瞬間、権限を降格します</small>
+        </div>
+
+        <div class="form-group">
+          <label>許可されたモデレーター (ユーザーIDまたはユーザー名)</label>
+          <div id="modTags" class="tag-input-box" onclick="focusInput('modTagInput')">
+            <input type="text" id="modTagInput" onkeydown="handleTagInput(event, 'mods')">
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>降格免除リスト (セクション荒らし時でも降格させない管理者・モデレーター)</label>
+          <div id="exemptTags" class="tag-input-box" onclick="focusInput('exemptTagInput')">
+            <input type="text" id="exemptTagInput" onkeydown="handleTagInput(event, 'exempt')">
+          </div>
+        </div>
+        <button class="btn btn-outline" style="width: 100%;" onclick="saveRoleLists()">権限設定 & リストを保存</button>
+      </div>
+
+      <!-- 荒らし対策ルール設定 -->
+      <div class="card">
+        <h2>🛡️ 荒らし検知・ブロックルール</h2>
+        <div class="form-group">
+          <label>許容最大セクション数 (超過で全削除&復旧シーケンス発動)</label>
+          <input type="number" id="maxSections" value="10" min="1" max="100">
+        </div>
+
+        <div class="form-group">
+          <label>大量連投DDoS検知閾値 (5秒以内の投稿数 - 超過で一斉降格&全削除)</label>
+          <input type="number" id="ddosThreshold" value="5" min="2" max="50">
+          <small style="color: var(--text-muted);">複数アカウントで一斉に連投してくる攻撃を即座にまとめて遮断します</small>
+        </div>
+
+        <div class="checkbox-group">
+          <input type="checkbox" id="deleteNonCollab" checked>
+          <label for="deleteNonCollab">コラボレーター外からの投稿・コメントを即座に完全削除 (部屋主は保護 / アカウントは削除せず読者に設定)</label>
+        </div>
+
+        <div class="checkbox-group">
+          <input type="checkbox" id="blockDuplicates" checked>
+          <label for="blockDuplicates">同一テキストの重複投稿を検知して処罰 (読者降格＆全削除)</label>
+        </div>
+
+        <div class="checkbox-group">
+          <input type="checkbox" id="blockImageRepeat" checked>
+          <label for="blockImageRepeat">同一画像の連続投稿ブロック (画像キャプション50文字制限も自動適用)</label>
+        </div>
+
+        <div class="checkbox-group">
+          <input type="checkbox" id="blockUrls">
+          <label for="blockUrls">外部リンク(URL)を含む投稿を即時ブロック＆全削除</label>
+        </div>
+
+        <div class="form-group" style="margin-top: 10px;">
+          <label>1投稿の最大文字数制限 (超過で即削除＆読者降格、0で無効)</label>
+          <input type="number" id="maxPostLength" value="500" min="0" max="10000">
+        </div>
+
+        <div class="form-group" style="margin-top: 14px;">
+          <label>正規表現ブロックパターン (例: ○○_ランダムな英数字)</label>
+          <input type="text" id="regexPattern" value="^.+_[a-zA-Z0-9]{4,}$">
+        </div>
+        <button class="btn btn-outline" style="width: 100%;" onclick="saveDefenseRules()">ルールを保存</button>
+      </div>
+    </div>
+
+    <!-- リアルタイム防衛ログ -->
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+        <h2>📜 リアルタイム防衛ログ</h2>
+        <button class="btn btn-outline" style="padding: 4px 10px; font-size: 0.8rem;" onclick="fetchStatus()">更新</button>
+      </div>
+      <div id="logContainer" class="log-container"></div>
+    </div>
+  </div>
+
+  <script>
+    let appConfig = {};
+    let tagData = {
+      admins: [],
+      mods: [],
+      exempt: []
+    };
+
+    async function init() {
+      await fetchStatus();
+      setInterval(fetchStatus, 3000); // 3秒ごとにステータスとログを自動同期
+    }
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+        
+        if (!data.logged_in) {
+          document.getElementById('loginModal').style.display = 'flex';
+          return;
+        } else {
+          document.getElementById('loginModal').style.display = 'none';
+        }
+
+        appConfig = data.config || {};
+        updateUI(data);
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function updateUI(data) {
+      // ステータスバッジ
+      const badge = document.getElementById('botStatusBadge');
+      const toggleBtn = document.getElementById('toggleBotBtn');
+      if (data.bot_running) {
+        badge.className = 'status-badge running';
+        badge.innerText = '● 監視中 (稼働)';
+        toggleBtn.className = 'btn btn-danger';
+        toggleBtn.innerText = '監視停止';
+      } else {
+        badge.className = 'status-badge stopped';
+        badge.innerText = '● 停止中';
+        toggleBtn.className = 'btn btn-primary';
+        toggleBtn.innerText = '監視開始';
+      }
+
+      // フォーム値の反映（初回のみ）
+      if (!window._formLoaded) {
+        document.getElementById('padletApiKey').value = appConfig.padlet_api_key || '';
+        document.getElementById('padletSessionToken').value = appConfig.padlet_session_token || appConfig.padlet_token || '';
+        document.getElementById('padletSecondaryToken').value = appConfig.padlet_secondary_token || '';
+        document.getElementById('discordWebhook').value = appConfig.discord_webhook_url || '';
+        document.getElementById('pollInterval').value = appConfig.poll_interval_seconds || 1.0;
+        document.getElementById('defaultVisitorRole').value = appConfig.default_visitor_role || 'reader';
+        document.getElementById('maxSections').value = appConfig.max_sections || 10;
+        document.getElementById('ddosThreshold').value = appConfig.ddos_threshold || 5;
+        document.getElementById('deleteNonCollab').checked = !!appConfig.delete_non_collaborators;
+        document.getElementById('blockDuplicates').checked = !!appConfig.block_duplicates;
+        document.getElementById('blockImageRepeat').checked = !!appConfig.block_image_repeat;
+        document.getElementById('blockUrls').checked = !!appConfig.block_urls;
+        document.getElementById('maxPostLength').value = appConfig.max_post_length ?? 500;
+        document.getElementById('regexPattern').value = appConfig.random_str_pattern || '^.+_[a-zA-Z0-9]{4,}$';
+
+        tagData.admins = appConfig.allowed_admins || [];
+        tagData.mods = appConfig.allowed_moderators || [];
+        tagData.exempt = appConfig.exempt_admins || [];
+        renderTags('admins');
+        renderTags('mods');
+        renderTags('exempt');
+
+        if (appConfig.main_board && appConfig.main_board.wall_id) {
+          renderBoardPreview('main', appConfig.main_board);
+          document.getElementById('mainBoardUrl').value = appConfig.main_board.original_url || '';
+        }
+        if (appConfig.backup_board && appConfig.backup_board.wall_id) {
+          renderBoardPreview('backup', appConfig.backup_board);
+          document.getElementById('backupBoardUrl').value = appConfig.backup_board.original_url || '';
+        }
+
+        window._formLoaded = true;
+      }
+
+      // ログの描画
+      const logContainer = document.getElementById('logContainer');
+      logContainer.innerHTML = (data.logs || []).map(l => `
+        <div class="log-entry">
+          <span class="log-time">[${l.timestamp.split(' ')[1]}]</span>
+          <span class="log-level ${l.level}">${l.level}</span>
+          <span>${l.title} ${l.details ? `(${l.details})` : ''}</span>
+        </div>
+      `).join('');
+    }
+
+    async function submitLogin() {
+      const pwd = document.getElementById('loginPassword').value;
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pwd })
+      });
+      const data = await res.json();
+      if (data.success) {
+        document.getElementById('loginModal').style.display = 'none';
+        fetchStatus();
+      } else {
+        document.getElementById('loginError').innerText = data.error || 'ログイン失敗';
+      }
+    }
+
+    async function toggleBot() {
+      const isRunning = document.getElementById('botStatusBadge').classList.contains('running');
+      await fetch('/api/bot/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ start: !isRunning })
+      });
+      fetchStatus();
+    }
+
+    async function forceRecovery() {
+      if (!confirm('本当に今すぐ手動でバックアップから復元しますか？現在のセクション・投稿が再構築されます。')) return;
+      const res = await fetch('/api/bot/force_recovery', { method: 'POST' });
+      const data = await res.json();
+      alert(data.message || data.error);
+      fetchStatus();
+    }
+
+    async function syncPosts() {
+      if (!confirm('バックアップボードからメインボードへ投稿をコピー・同期しますか？')) return;
+      const res = await fetch('/api/bot/sync_posts', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        alert(`バックアップからの投稿同期が完了しました！\n成功件数: ${data.copied_count} / ${data.total_posts} 件`);
+      } else {
+        alert(data.error || '同期に失敗しました');
+      }
+      fetchStatus();
+    }
+
+    async function resolveBoard(type) {
+      const url = document.getElementById(type === 'main' ? 'mainBoardUrl' : 'backupBoardUrl').value;
+      if (!url) {
+        alert('URLを入力してください');
+        return;
+      }
+      const res = await fetch('/api/resolve_board', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type, url })
+      });
+      const data = await res.json();
+      if (data.success) {
+        renderBoardPreview(type, data.resolved);
+      } else {
+        alert(data.error);
+      }
+    }
+
+    function renderBoardPreview(type, board) {
+      const el = document.getElementById(type === 'main' ? 'mainBoardPreview' : 'backupBoardPreview');
+      el.innerHTML = `
+        <h4>${board.title}</h4>
+        <div><strong>Wall ID:</strong> ${board.wall_id} | <strong>Hash ID:</strong> ${board.wall_hashid}</div>
+        ${board.background_url ? `<div style="margin-top: 4px;"><img src="${board.background_url}" style="height: 40px; border-radius: 4px; object-fit: cover;"></div>` : ''}
+      `;
+    }
+
+    async function saveBasicConfig() {
+      const apiKey = document.getElementById('padletApiKey').value;
+      const sessionToken = document.getElementById('padletSessionToken').value;
+      const secToken = document.getElementById('padletSecondaryToken').value;
+      const webhook = document.getElementById('discordWebhook').value;
+      const interval = parseFloat(document.getElementById('pollInterval').value);
+      const visitorRole = document.getElementById('defaultVisitorRole').value;
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          padlet_api_key: apiKey,
+          padlet_session_token: sessionToken,
+          padlet_secondary_token: secToken,
+          discord_webhook_url: webhook,
+          poll_interval_seconds: interval,
+          default_visitor_role: visitorRole
+        })
+      });
+      alert('アカウント・全体権限設定を保存しました');
+    }
+
+    async function saveDefenseRules() {
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          max_sections: parseInt(document.getElementById('maxSections').value, 10),
+          ddos_threshold: parseInt(document.getElementById('ddosThreshold').value, 10),
+          delete_non_collaborators: document.getElementById('deleteNonCollab').checked,
+          block_duplicates: document.getElementById('blockDuplicates').checked,
+          block_image_repeat: document.getElementById('blockImageRepeat').checked,
+          block_urls: document.getElementById('blockUrls').checked,
+          max_post_length: parseInt(document.getElementById('maxPostLength').value, 10),
+          random_str_pattern: document.getElementById('regexPattern').value
+        })
+      });
+      alert('荒らし対策・DDoSルールを保存しました');
+    }
+
+    async function saveRoleLists() {
+      const visitorRole = document.getElementById('defaultVisitorRole').value;
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          default_visitor_role: visitorRole,
+          allowed_admins: tagData.admins,
+          allowed_moderators: tagData.mods,
+          exempt_admins: tagData.exempt
+        })
+      });
+      alert('全体の権限および権限リストを保存しました');
+    }
+
+    function renderTags(type) {
+      const map = { admins: 'adminTags', mods: 'modTags', exempt: 'exemptTags' };
+      const inputIdMap = { admins: 'adminTagInput', mods: 'modTagInput', exempt: 'exemptTagInput' };
+      const container = document.getElementById(map[type]);
+      const input = document.getElementById(inputIdMap[type]);
+      
+      container.querySelectorAll('.tag').forEach(t => t.remove());
+      tagData[type].forEach(val => {
+        const span = document.createElement('span');
+        span.className = 'tag';
+        span.innerHTML = `${val} <span class="remove" onclick="removeTag('${type}', '${val}')">&times;</span>`;
+        container.insertBefore(span, input);
+      });
+    }
+
+    function handleTagInput(e, type) {
+      if (e.key === 'Enter' || e.key === ',') {
+        e.preventDefault();
+        const val = e.target.value.trim();
+        if (val && !tagData[type].includes(val)) {
+          tagData[type].push(val);
+          renderTags(type);
+        }
+        e.target.value = '';
+      }
+    }
+
+    function removeTag(type, val) {
+      tagData[type] = tagData[type].filter(x => x !== val);
+      renderTags(type);
+    }
+
+    function focusInput(id) {
+      document.getElementById(id).focus();
+    }
+
+    window.onload = init;
+  </script>
+</body>
+</html>
