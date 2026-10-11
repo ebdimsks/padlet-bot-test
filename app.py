@@ -454,9 +454,9 @@ if __name__ == "__main__":
     else:
         print("⚠️  [SECURITY NOTICE] 環境変数 ADMIN_PASSWORD が未設定です。")
         print(f"🔑 自動生成された安全な管理者パスワード: {current_pwd}")
-        print("💡 Railway 等の本番環境では Variables で ADMIN_PASSWORD を設定してください。")
+    print("💡 監視エンジンは安全のため初期状態で【停止中】です。")
+    print("👉 管理画面でURL・権限設定を確認後、【監視開始】ボタンを押して起動してください。")
     print("=" * 65 + "\n")
 
-    # 起動時に自動で監視開始
-    engine.start()
+    # 最初は監視オフ（管理画面から手動でオンにする）
     app.run(host="0.0.0.0", port=port, debug=False)

@@ -44,6 +44,12 @@ class SpamMonitorEngine:
 
         # 投稿履歴キャッシュ: user_id -> [(timestamp, text, image_url, post_id)]
         self.user_post_history: Dict[str, List[tuple]] = {}
+        # アカウント別投稿タイムスタンプ履歴 (1秒2件/2秒4件の個別レート判定用): user_id -> [float]
+        self.user_post_timestamps: Dict[str, List[float]] = {}
+        # アカウント別画像投稿履歴 (同一画像の短期間連投判定用): user_id -> [(timestamp, image_url, post_id)]
+        self.user_image_history: Dict[str, List[tuple]] = {}
+        # 既知の投稿IDセット (サイクルごとの新規投稿検知・暴走防止用)
+        self.known_post_ids: Set[str] = set()
         # 短時間アクティビティ履歴 (DDoS検知用): [(timestamp, user_id, post_id)]
         self.recent_activity_log: List[tuple] = []
         # 復元中フラグ
@@ -110,6 +116,10 @@ class SpamMonitorEngine:
         カスタムキー/カスタム値(custom_properties)にも完全対応
         """
         data = self.get_data()
+        webhook_url = data.get("discord_webhook_url", "").strip()
+        if webhook_url:
+            return  # Webhook登録時はPadletでは通知しない！
+
         main_board = data.get("main_board", {})
         wall_id = main_board.get("wall_id")
         wall_hashid = main_board.get("wall_hashid")
@@ -283,64 +293,28 @@ class SpamMonitorEngine:
             # ※ここで return せず、同時に発生している投稿荒らしも下のステップで即座に対処する！
 
         # =====================================================================
-        # 4. 投稿 & コメント荒らしの多層防御監視 (20人同時荒らし・DDoS・キャプション制限)
+        # 4. 投稿 & コメント荒らしの精密・高精度防衛監視 (誤検知完全防止)
         # =====================================================================
         posts = self.client.get_posts(main_wall_hashid)
         comments = self.client.get_comments(main_wall_hashid)
 
         delete_non_collab = data.get("delete_non_collaborators", True)
-        block_duplicates = data.get("block_duplicates", True)
-        block_image_repeat = data.get("block_image_repeat", True)
-        block_urls = data.get("block_urls", False)
-        max_post_length = int(data.get("max_post_length", 500))
-        random_str_regex = data.get("random_str_pattern", r"^.+_[a-zA-Z0-9]{4,}$")
-        ddos_threshold = int(data.get("ddos_threshold", 5))
 
-        # 処罰対象アカウントIDの集合 & 削除対象投稿IDの集合
+        # 処罰対象 (読者に降格 & その人の投稿を全削除)
         spammer_uids_to_punish: Set[str] = set()
+        # 削除対象投稿IDの集合 (荒らし投稿、非コラボ投稿、キャプション50文字以上)
         posts_to_delete: Set[str] = set()
 
-        # (A) DDoS（短時間での投稿急増）の検知
-        for p in posts:
-            pid = p.get("id")
-            aid = p.get("author_id")
-            if pid and not any(x[2] == pid for x in self.recent_activity_log):
-                self.recent_activity_log.append((now, aid, pid))
+        # 現在存在する全投稿ID
+        current_post_ids = {p.get("id") for p in posts if p.get("id")}
+        # 前回のサイクル以降に新しく検出された投稿
+        new_posts = [p for p in posts if p.get("id") and p.get("id") not in self.known_post_ids]
 
-        self.recent_activity_log = [x for x in self.recent_activity_log if now - x[0] <= 10.0]
-        recent_count = len([x for x in self.recent_activity_log if now - x[0] <= 5.0])
-
-        if recent_count >= ddos_threshold:
-            # 5秒以内に投稿した全ユーザーを特定
-            ddos_authors = {x[1] for x in self.recent_activity_log if x[1] and x[1] != "anonymous"}
-            filtered_ddos_authors = {
-                uid for uid in ddos_authors
-                if uid != owner_id and uid not in exempt_admins and collab_map.get(uid, {}).get("username") not in exempt_admins
-            }
-            if filtered_ddos_authors:
-                self.add_log("ALERT", "⚡ 大量連投DDoS攻撃を検知！", f"5秒間に{recent_count}件の新規投稿 (関与アカウント: {len(filtered_ddos_authors)}名)")
-                self.send_discord_webhook(
-                    "🚨 大量連投DDoS攻撃を検知・一括遮断！",
-                    f"短時間(5秒間)に **{recent_count} 件** の異常な投稿急増を検知しました。\n対象の全荒らしアカウント({len(filtered_ddos_authors)}名)の権限を一斉に「閲覧のみ」に降格し、投稿を完全一掃します。",
-                    color=0xFF0000,
-                    fields=[
-                        {"name": "⚠️ 攻撃検知数", "value": f"{recent_count}件 / 5秒", "inline": True},
-                        {"name": "👤 処罰対象アカウント数", "value": f"{len(filtered_ddos_authors)}名", "inline": True},
-                        {"name": "🛡️ 防衛アクション", "value": "一斉権限剥奪(Reader) ➜ 並列全投稿削除 ➜ 再確認", "inline": False}
-                    ],
-                    mention_everyone=True
-                )
-                spammer_uids_to_punish.update(filtered_ddos_authors)
-                # DDoS発生時に投稿された最近の投稿もすべて削除対象に追加
-                for x in self.recent_activity_log:
-                    if x[1] in filtered_ddos_authors or x[1] == "anonymous":
-                        posts_to_delete.add(x[2])
-
-        # (B) マルチアカウント協調荒らし検知 (20人が別アカウントで同一テキスト/同一画像を爆撃)
-        text_post_map: Dict[str, List[tuple]] = {}  # text -> [(post_id, author_id)]
-        img_post_map: Dict[str, List[tuple]] = {}   # img_url -> [(post_id, author_id)]
-
-        for p in posts:
+        # -------------------------------------------------------------
+        # 【投稿荒らし検知 ①】1秒間に2投稿以上、または2秒間に4投稿以上
+        # 「その荒らした人だけ」荒らし判定にする。処罰は読者。投稿はすべて削除。
+        # -------------------------------------------------------------
+        for p in new_posts:
             pid = p.get("id")
             aid = p.get("author_id", "anonymous")
             if owner_id and aid == owner_id:
@@ -348,42 +322,105 @@ class SpamMonitorEngine:
             if aid in exempt_admins or collab_map.get(aid, {}).get("username") in exempt_admins:
                 continue
 
-            full_t = f"{p.get('subject', '')} {p.get('content', '')}".strip()
-            if len(full_t) >= 10:  # 10文字以上の同一テキスト
-                text_post_map.setdefault(full_t, []).append((pid, aid))
+            # Bot自身の防衛通知は除外
+            fp = f"{p.get('subject', '')}:::{p.get('content', '')}"
+            if fp in self.protected_post_fingerprints or (p.get("subject") or "").startswith("🛡️ [防衛通知]"):
+                continue
 
-            att = p.get("attachment")
-            if att:
-                img_post_map.setdefault(att, []).append((pid, aid))
+            if aid not in self.user_post_timestamps:
+                self.user_post_timestamps[aid] = []
+            self.user_post_timestamps[aid].append(now)
 
-        # 同一テキストを複数アカウントから爆撃している場合
-        for txt, p_list in text_post_map.items():
-            distinct_authors = {x[1] for x in p_list if x[1] != "anonymous"}
-            if len(p_list) >= 3 and len(distinct_authors) >= 2:
-                self.add_log("ALERT", f"複数アカウント協調コピペ爆撃を検知: {len(distinct_authors)}名のアカウント", f"内容: {txt[:40]}")
-                spammer_uids_to_punish.update(distinct_authors)
-                for pid, aid in p_list:
+        # アカウントごとの連投レート判定
+        for aid, timestamps in list(self.user_post_timestamps.items()):
+            # 直近10秒以内のタイムスタンプのみ保持
+            valid_ts = [t for t in timestamps if now - t <= 10.0]
+            self.user_post_timestamps[aid] = valid_ts
+
+            if owner_id and aid == owner_id:
+                continue
+            if aid in exempt_admins or collab_map.get(aid, {}).get("username") in exempt_admins:
+                continue
+
+            # 1秒間に2投稿以上、または2秒間に4投稿以上
+            count_1s = len([t for t in valid_ts if now - t <= 1.0])
+            count_2s = len([t for t in valid_ts if now - t <= 2.0])
+
+            if count_1s >= 2 or count_2s >= 4:
+                author_name = collab_map.get(aid, {}).get("username") or collab_map.get(aid, {}).get("name") or aid
+                reason = f"連投爆撃検知 (1秒に{count_1s}件 / 2秒に{count_2s}件)"
+                self.add_log("ALERT", f"連投荒らし検知: {author_name}", reason)
+                if aid and aid != "anonymous":
+                    spammer_uids_to_punish.add(aid)
+
+        # -------------------------------------------------------------
+        # 【投稿荒らし検知 ②】同じ画像を短期間に複数投稿
+        # 「その荒らした人だけ」荒らし判定にする。処罰は読者。投稿はすべて削除。
+        # -------------------------------------------------------------
+        for p in new_posts:
+            pid = p.get("id")
+            aid = p.get("author_id", "anonymous")
+            if owner_id and aid == owner_id:
+                continue
+            if aid in exempt_admins or collab_map.get(aid, {}).get("username") in exempt_admins:
+                continue
+
+            fp = f"{p.get('subject', '')}:::{p.get('content', '')}"
+            if fp in self.protected_post_fingerprints or (p.get("subject") or "").startswith("🛡️ [防衛通知]"):
+                continue
+
+            attachment = p.get("attachment")
+            if attachment:
+                if aid not in self.user_image_history:
+                    self.user_image_history[aid] = []
+
+                # 直近30秒以内の画像履歴
+                img_hist = [item for item in self.user_image_history[aid] if now - item[0] <= 30.0]
+                same_img = [item for item in img_hist if item[1] == attachment and item[2] != pid]
+                if same_img:
+                    author_name = collab_map.get(aid, {}).get("username") or collab_map.get(aid, {}).get("name") or aid
+                    self.add_log("ALERT", f"同一画像連投荒らし検知: {author_name}", f"短期間に同一画像を重複投稿 (PostID: {pid})")
+                    if aid and aid != "anonymous":
+                        spammer_uids_to_punish.add(aid)
+
+                img_hist.append((now, attachment, pid))
+                self.user_image_history[aid] = img_hist
+
+        # -------------------------------------------------------------
+        # 【読者にはしないけど、投稿を削除するやつ】
+        # ① 画像のキャプションのところが50文字以上の投稿
+        # ② コラボレーター以外の投稿
+        # -------------------------------------------------------------
+        for p in posts:
+            pid = p.get("id")
+            aid = p.get("author_id", "anonymous")
+            if not pid:
+                continue
+            if owner_id and aid == owner_id:
+                continue  # 部屋主は保護
+            if aid in exempt_admins or collab_map.get(aid, {}).get("username") in exempt_admins:
+                continue
+
+            fp = f"{p.get('subject', '')}:::{p.get('content', '')}"
+            if fp in self.protected_post_fingerprints or (p.get("subject") or "").startswith("🛡️ [防衛通知]"):
+                continue
+
+            # ① 画像キャプションが50文字以上 -> 投稿のみ削除 (読者にはしない)
+            caption = (p.get("attachment_caption") or "").strip()
+            if len(caption) >= 50:
+                posts_to_delete.add(pid)
+                self.add_log("DEFENSE", f"画像キャプション50文字以上の投稿を削除: {len(caption)}文字 (PostID: {pid})")
+                continue
+
+            # ② コラボレーター以外の投稿 -> 投稿のみ削除 (読者にはしない)
+            if delete_non_collab:
+                if aid not in registered_collab_ids:
                     posts_to_delete.add(pid)
-
-        # 同一画像を複数アカウントから爆撃している場合
-        for img, p_list in img_post_map.items():
-            distinct_authors = {x[1] for x in p_list if x[1] != "anonymous"}
-            if len(p_list) >= 3 and len(distinct_authors) >= 2:
-                self.add_log("ALERT", f"複数アカウント協調画像爆撃を検知: {len(distinct_authors)}名のアカウント", f"画像: {img}")
-                spammer_uids_to_punish.update(distinct_authors)
-                for pid, aid in p_list:
-                    posts_to_delete.add(pid)
-
-        # (C) 非コラボレーターの投稿・コメント即時削除 (部屋主は完全保護)
-        if delete_non_collab:
-            for p in posts:
-                author_id = p.get("author_id")
-                if owner_id and author_id == owner_id:
+                    self.add_log("DEFENSE", f"非コラボレーター投稿を削除: {pid} (Author: {aid})")
                     continue
-                # コラボレーター登録されていない（または匿名）場合は即削除
-                if author_id not in registered_collab_ids:
-                    posts_to_delete.add(p["id"])
 
+        # コラボレーター以外のコメント即時削除 (部屋主は完全保護)
+        if delete_non_collab:
             for c in comments:
                 try:
                     c_author_id = str(c.get("author", {}).get("id", ""))
@@ -396,81 +433,16 @@ class SpamMonitorEngine:
                 except Exception:
                     pass
 
-        # (D) 各投稿の個別荒らし判定 (匿名でもアカウントでも厳格判定)
-        for p in posts:
-            try:
-                pid = p.get("id")
-                author_id = p.get("author_id", "anonymous")
-                if owner_id and author_id == owner_id:
-                    continue  # 部屋主は保護
-                if author_id in exempt_admins or collab_map.get(author_id, {}).get("username") in exempt_admins:
-                    continue  # 免除者は保護
+        # -------------------------------------------------------------
+        # 荒らしに検知した人の投稿は「絶対にすべて削除」
+        # -------------------------------------------------------------
+        if spammer_uids_to_punish:
+            for p in posts:
+                if p.get("author_id") in spammer_uids_to_punish and p.get("id"):
+                    posts_to_delete.add(p["id"])
 
-                # 復旧処理でコピーされた投稿やBotの防衛通知投稿は誤削除しない
-                fp = f"{p.get('subject', '')}:::{p.get('content', '')}"
-                if fp in self.protected_post_fingerprints or (p.get("subject") or "").startswith("🛡️ [防衛通知]"):
-                    continue
-
-                content = (p.get("content") or "").strip()
-                subject = (p.get("subject") or "").strip()
-                full_text = f"{subject} {content}".strip()
-                attachment = p.get("attachment")
-                caption = (p.get("attachment_caption") or "").strip()
-                author_name = collab_map.get(author_id, {}).get("username") or collab_map.get(author_id, {}).get("name") or author_id
-
-                is_violation = False
-                violation_reason = ""
-
-                # ルール1: 画像キャプション文字数制限 (50文字超過で即削除＆処罰)
-                if len(caption) > 50:
-                    is_violation = True
-                    violation_reason = f"画像キャプション50文字超過 ({len(caption)}文字)"
-
-                # ルール2: 最大文字数制限
-                elif max_post_length > 0 and len(full_text) > max_post_length:
-                    is_violation = True
-                    violation_reason = f"長文スパム ({len(full_text)}文字 / 上限{max_post_length})"
-
-                # ルール3: 外部リンク (URL) ブロック
-                elif block_urls and re.search(r'https?://[^\s]+', full_text):
-                    is_violation = True
-                    violation_reason = f"外部リンク禁止違反: {full_text[:30]}"
-
-                # ルール4: パターン荒らし検知 (○○_ランダム英数字等)
-                elif random_str_regex:
-                    try:
-                        if re.search(random_str_regex, full_text):
-                            is_violation = True
-                            violation_reason = f"パターン荒らし一致: {full_text[:30]}"
-                    except Exception:
-                        pass
-
-                # ルール5: 同一アカウントによる連続投稿・同一画像連投
-                if not is_violation and author_id and author_id != "anonymous":
-                    if author_id not in self.user_post_history:
-                        self.user_post_history[author_id] = []
-                    hist = self.user_post_history[author_id]
-                    if hist:
-                        last_t, last_txt, last_img, last_p = hist[-1]
-                        if block_duplicates and full_text and full_text == last_txt and pid != last_p:
-                            is_violation = True
-                            violation_reason = f"同一テキスト連投: {full_text[:30]}"
-                        elif block_image_repeat and attachment and attachment == last_img and pid != last_p:
-                            is_violation = True
-                            violation_reason = "同一画像連続投稿"
-                    hist.append((now, full_text, attachment, pid))
-                    if len(hist) > 20:
-                        self.user_post_history[author_id] = hist[-20:]
-
-                # 違反が検知された場合
-                if is_violation:
-                    posts_to_delete.add(pid)
-                    self.add_log("ALERT", f"荒らし投稿検知: {author_name}", f"理由: {violation_reason} (PostID: {pid})")
-                    if author_id and author_id != "anonymous":
-                        spammer_uids_to_punish.add(author_id)
-
-            except Exception as e:
-                logger.debug(f"投稿チェック例外: {e}")
+        # 既知投稿IDの更新 (次回サイクルの新規投稿判定用)
+        self.known_post_ids = current_post_ids
 
         # (E) 処罰 & 削除の超高速並列実行 (20人同時荒らし・大量投稿一括鎮圧)
         if spammer_uids_to_punish or posts_to_delete:
@@ -566,26 +538,46 @@ class SpamMonitorEngine:
             if len(spammer_list) > 15:
                 names_str += f" 他 {len(spammer_list) - 15}名"
 
-            report = (
-                f"🚨 **荒らし行為を一括鎮圧しました！**\n"
-                f"- **処罰アカウント数**: {len(spammer_ids)}名 (コラボレーター削除ではなく「読者(reader)」に設定・固定)\n"
-                f"- **削除投稿数**: {deleted_count}件\n"
-                f"- **ダブルチェック**: 残存ゼロ確認済"
-            )
-            self.add_log("SUCCESS", "荒らし一括処罰完了", report)
+            if spammer_ids:
+                report = (
+                    f"🚨 **荒らし行為を一括鎮圧しました！**\n"
+                    f"- **処罰アカウント数**: {len(spammer_ids)}名 (コラボレーター削除ではなく「読者(reader)」に設定・固定)\n"
+                    f"- **削除投稿数**: {deleted_count}件\n"
+                    f"- **ダブルチェック**: 残存ゼロ確認済"
+                )
+                self.add_log("SUCCESS", "荒らし一括処罰完了", report)
 
-            self.send_discord_webhook(
-                "⛔ 荒らしアカウント処罰 (読者に設定) & 投稿完全削除完了",
-                report,
-                color=0xFF0000,
-                fields=[
-                    {"name": "👤 処罰アカウント一覧", "value": names_str or "匿名荒らし / なし", "inline": False},
-                    {"name": "🗑️ 削除された投稿数", "value": f"{deleted_count} 件", "inline": True},
-                    {"name": "🔒 付与された権限", "value": "読者 (Reader - 削除せず閲覧のみに固定)", "inline": True},
-                    {"name": "🛡️ 状態", "value": "再確認ダブルチェック完了・安全", "inline": True}
-                ],
-                mention_everyone=True
-            )
+                self.send_discord_webhook(
+                    "⛔ 荒らしアカウント処罰 (読者に設定) & 投稿完全削除完了",
+                    report,
+                    color=0xFF0000,
+                    fields=[
+                        {"name": "👤 処罰アカウント一覧", "value": names_str or "匿名荒らし / なし", "inline": False},
+                        {"name": "🗑️ 削除された投稿数", "value": f"{deleted_count} 件", "inline": True},
+                        {"name": "🔒 付与された権限", "value": "読者 (Reader - 削除せず閲覧のみに固定)", "inline": True},
+                        {"name": "🛡️ 状態", "value": "再確認ダブルチェック完了・安全", "inline": True}
+                    ],
+                    mention_everyone=True
+                )
+            elif deleted_count > 0:
+                report = (
+                    f"🗑️ **ルール違反投稿の削除を完了しました**\n"
+                    f"- **削除投稿数**: {deleted_count}件 (画像キャプション50文字以上 または 非コラボレーター投稿)\n"
+                    f"- **アカウント処罰**: なし (投稿のみ安全に削除)"
+                )
+                self.add_log("DEFENSE", "違反投稿削除完了", report)
+
+                self.send_discord_webhook(
+                    "🗑️ 違反投稿削除完了 (キャプション50文字以上 / 非コラボレーター)",
+                    report,
+                    color=0xFFA500,
+                    fields=[
+                        {"name": "🗑️ 削除された投稿数", "value": f"{deleted_count} 件", "inline": True},
+                        {"name": "👤 アカウント処罰", "value": "なし (投稿削除のみ)", "inline": True},
+                        {"name": "🛡️ 状態", "value": "安全", "inline": True}
+                    ],
+                    mention_everyone=False
+                )
 
         except Exception as e:
             logger.error(f"一括処罰処理エラー: {e}", exc_info=True)
