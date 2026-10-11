@@ -17,9 +17,14 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
 from padlet_client import PadletClient
 from monitor_engine import SpamMonitorEngine
 
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 load_dotenv()
 
 # ロギング設定
@@ -31,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 import secrets
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "bot_config.json")
 _config_lock = threading.Lock()
 _config_cache = None
@@ -143,7 +147,7 @@ def load_config() -> dict:
             _config_cache.setdefault("exempt_admins", [])
             _config_cache.setdefault("max_sections", 10)
             _config_cache.setdefault("poll_interval_seconds", 1.0)
-            _config_cache.setdefault("default_visitor_role", "none")  # 初期値: アクセスなし (none)
+            _config_cache.setdefault("default_visitor_role", "commenter")  # 初期値: コメンター (commenter)
             _config_cache.setdefault("ddos_threshold", 5)  # 短時間投稿急増時のDDoS検知閾値
             _config_cache.setdefault("delete_non_collaborators", True)
             _config_cache.setdefault("block_duplicates", True)

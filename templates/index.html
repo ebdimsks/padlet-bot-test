@@ -437,17 +437,17 @@
 
         <div class="checkbox-group">
           <input type="checkbox" id="deleteNonCollab" checked>
-          <label for="deleteNonCollab">コラボレーター外からの投稿・コメントを即座に完全削除 (部屋主は保護 / アカウントは削除せず読者に設定)</label>
+          <label for="deleteNonCollab">コラボレーター以外の投稿を削除 (※全体の権限がライターの場合は削除されません / コメントは常に許可)</label>
         </div>
 
         <div class="checkbox-group">
           <input type="checkbox" id="blockDuplicates" checked>
-          <label for="blockDuplicates">同一テキストの重複投稿を検知して処罰 (読者降格＆全削除)</label>
+          <label for="blockDuplicates">短時間連投の荒らし検知 (1秒2投稿以上 / 2秒4投稿以上でその人のみ読者降格＆全投稿削除)</label>
         </div>
 
         <div class="checkbox-group">
           <input type="checkbox" id="blockImageRepeat" checked>
-          <label for="blockImageRepeat">同一画像の連続投稿ブロック (画像キャプション50文字制限も自動適用)</label>
+          <label for="blockImageRepeat">同一画像の短期間連投検知 (その人のみ読者降格＆全投稿削除) ＆ 画像キャプション50文字以上の投稿削除</label>
         </div>
 
         <div class="checkbox-group">
@@ -534,7 +534,7 @@
         document.getElementById('customKeyInput').value = appConfig.custom_key || '';
         document.getElementById('customValueInput').value = appConfig.custom_value || '';
         document.getElementById('pollInterval').value = appConfig.poll_interval_seconds || 1.0;
-        document.getElementById('defaultVisitorRole').value = appConfig.default_visitor_role || 'reader';
+        document.getElementById('defaultVisitorRole').value = appConfig.default_visitor_role || 'commenter';
         document.getElementById('maxSections').value = appConfig.max_sections || 10;
         document.getElementById('ddosThreshold').value = appConfig.ddos_threshold || 5;
         document.getElementById('deleteNonCollab').checked = !!appConfig.delete_non_collaborators;

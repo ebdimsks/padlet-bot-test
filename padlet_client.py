@@ -258,7 +258,7 @@ class PadletClient:
     # 投稿 (Wishes) 関連 API
     # -------------------------------------------------------------
     def get_posts(self, wall_hashid: str, limit: int = 100) -> List[Dict[str, Any]]:
-        """全投稿を取得 (custom_properties等の詳細属性も完全抽出)"""
+        """全投稿を取得 (custom_properties等の詳細属性も完全抽出 & 作成者情報の確実な抽出 & included対応)"""
         posts = []
         page = 1
         while page <= 10:  # 最大1000件まで探索
@@ -266,9 +266,22 @@ class PadletClient:
                 res = self.request('GET', f"https://padlet.com/api/10/wishes?wall_hashid={wall_hashid}&page={page}&limit={limit}")
                 if res.status_code != 200:
                     break
-                data = res.json().get("data", [])
+                res_json = res.json()
+                data = res_json.get("data", [])
                 if not data:
                     break
+
+                # included からユーザー情報 (id -> {username, name}) を事前構築
+                user_map: Dict[str, Dict[str, str]] = {}
+                for inc in res_json.get("included", []):
+                    if inc.get("type") in ("user", "users"):
+                        u_id = str(inc.get("id", ""))
+                        u_attrs = inc.get("attributes", {})
+                        if u_id:
+                            user_map[u_id] = {
+                                "username": str(u_attrs.get("username") or ""),
+                                "name": str(u_attrs.get("name") or "")
+                            }
 
                 for item in data:
                     attrs = item.get("attributes", {})
@@ -298,14 +311,38 @@ class PadletClient:
                     if not attachment_caption and attrs.get("caption"):
                         attachment_caption = str(attrs.get("caption") or "")
 
-                    author_id = attrs.get("author_id")
+                    # 作成者ID (author_id / user_id / creator_id / relationships) を全網羅
+                    raw_author_id = attrs.get("author_id") or attrs.get("user_id") or attrs.get("creator_id")
+                    if not raw_author_id and isinstance(attrs.get("author"), dict):
+                        raw_author_id = attrs.get("author", {}).get("id")
+                    if not raw_author_id and isinstance(attrs.get("user"), dict):
+                        raw_author_id = attrs.get("user", {}).get("id")
+                    if not raw_author_id:
+                        author_rel = item.get("relationships", {}).get("author", {}).get("data", {})
+                        user_rel = item.get("relationships", {}).get("user", {}).get("data", {})
+                        raw_author_id = author_rel.get("id") or user_rel.get("id")
+
+                    raw_author_name = ""
+                    if isinstance(attrs.get("author"), dict):
+                        raw_author_name = attrs.get("author", {}).get("username") or attrs.get("author", {}).get("name") or ""
+                    if not raw_author_name and isinstance(attrs.get("user"), dict):
+                        raw_author_name = attrs.get("user", {}).get("username") or attrs.get("user", {}).get("name") or ""
+
+                    # included マップからのユーザー名解決
+                    if raw_author_id:
+                        mapped = user_map.get(str(raw_author_id))
+                        if mapped:
+                            if not raw_author_name:
+                                raw_author_name = mapped.get("username") or mapped.get("name") or ""
+
                     custom_props = attrs.get("custom_properties")
 
                     posts.append({
                         "id": str(item.get("id")),
                         "subject": subject_text,
                         "content": content_text,
-                        "author_id": str(author_id) if author_id is not None else "anonymous",
+                        "author_id": str(raw_author_id) if raw_author_id is not None else "anonymous",
+                        "author_name": str(raw_author_name or ""),
                         "attachment": attachment_url,
                         "attachment_caption": attachment_caption.strip(),
                         "section_id": str(attrs.get("wall_section_id", "")) if attrs.get("wall_section_id") else None,
@@ -409,7 +446,7 @@ class PadletClient:
     # コメント 関連 API
     # -------------------------------------------------------------
     def get_comments(self, wall_hashid: str) -> List[Dict[str, Any]]:
-        """全コメント取得"""
+        """全コメント取得 (作成者情報・本文を正規化して抽出)"""
         comments = []
         page = 1
         while page <= 10:
@@ -417,11 +454,67 @@ class PadletClient:
                 res = self.request('GET', f"https://padlet.com/api/9/comments?wall_hashid={wall_hashid}&page={page}&limit=100")
                 if res.status_code != 200:
                     break
-                data = res.json().get("data", [])
-                if not data:
+                res_json = res.json()
+                raw_data = res_json.get("data", [])
+                if not raw_data:
                     break
-                comments.extend(data)
-                if len(data) < 100:
+
+                # included からユーザー情報を事前構築
+                c_user_map: Dict[str, Dict[str, str]] = {}
+                for inc in res_json.get("included", []):
+                    if inc.get("type") in ("user", "users"):
+                        u_id = str(inc.get("id", ""))
+                        u_attrs = inc.get("attributes", {})
+                        if u_id:
+                            c_user_map[u_id] = {
+                                "username": str(u_attrs.get("username") or ""),
+                                "name": str(u_attrs.get("name") or "")
+                            }
+
+                for item in raw_data:
+                    cid = str(item.get("id", ""))
+                    attrs = item.get("attributes", {})
+                    
+                    # 作成者ID (author_id / user_id / relationships) の網羅的抽出
+                    c_aid = attrs.get("author_id") or attrs.get("user_id") or attrs.get("creator_id")
+                    if not c_aid and isinstance(attrs.get("author"), dict):
+                        c_aid = attrs.get("author", {}).get("id")
+                    if not c_aid and isinstance(attrs.get("user"), dict):
+                        c_aid = attrs.get("user", {}).get("id")
+                    if not c_aid:
+                        user_rel = item.get("relationships", {}).get("user", {}).get("data", {})
+                        author_rel = item.get("relationships", {}).get("author", {}).get("data", {})
+                        c_aid = user_rel.get("id") or author_rel.get("id")
+
+                    c_name = ""
+                    if isinstance(attrs.get("author"), dict):
+                        c_name = attrs.get("author", {}).get("username") or attrs.get("author", {}).get("name") or ""
+                    if not c_name and isinstance(attrs.get("user"), dict):
+                        c_name = attrs.get("user", {}).get("username") or attrs.get("user", {}).get("name") or ""
+
+                    if c_aid and not c_name:
+                        c_mapped = c_user_map.get(str(c_aid))
+                        if c_mapped:
+                            c_name = c_mapped.get("username") or c_mapped.get("name") or ""
+
+                    body_val = attrs.get("body") or attrs.get("value") or ""
+                    body_text = body_val.get("text", "") if isinstance(body_val, dict) else str(body_val or "")
+
+                    wish_id = attrs.get("wish_id") or attrs.get("wall_wish_id")
+                    if not wish_id:
+                        wish_rel = item.get("relationships", {}).get("wish", {}).get("data", {})
+                        wish_id = wish_rel.get("id")
+
+                    comments.append({
+                        "id": cid,
+                        "author_id": str(c_aid) if c_aid is not None else "anonymous",
+                        "author_name": str(c_name or ""),
+                        "content": str(body_text),
+                        "wish_id": str(wish_id) if wish_id else None,
+                        "created_at": attrs.get("created_at")
+                    })
+
+                if len(raw_data) < 100:
                     break
                 page += 1
             except Exception:
@@ -429,10 +522,18 @@ class PadletClient:
         return comments
 
     def delete_comment(self, comment_id: str) -> bool:
-        """コメント削除"""
-        for ep in [f"https://padlet.com/api/8/comments/{comment_id}", f"https://padlet.com/api/9/comments/{comment_id}"]:
+        """コメント削除 (全APIバージョン対応)"""
+        if not comment_id:
+            return False
+        endpoints = [
+            f"https://padlet.com/api/8/comments/{comment_id}",
+            f"https://padlet.com/api/9/comments/{comment_id}",
+            f"https://padlet.com/api/10/comments/{comment_id}",
+            f"https://padlet.com/api/5/comments/{comment_id}"
+        ]
+        for ep in endpoints:
             try:
-                res = self.request('DELETE', ep)
+                res = self.request('DELETE', ep, timeout=5)
                 if res.status_code in (200, 204):
                     return True
             except Exception:
@@ -483,20 +584,49 @@ class PadletClient:
             pass
         return None
 
-    def delete_section(self, section_id: str) -> bool:
-        """セクション削除"""
-        try:
-            res = self.request('DELETE', f"https://padlet.com/api/5/wall_sections/{section_id}?soft_delete=true")
-            return res.status_code in (200, 204)
-        except Exception:
+    def delete_section(self, section_id: str, wall_id: Optional[int] = None) -> bool:
+        """セクション削除 (全エンドポイント・全クエリ対応)"""
+        if not section_id:
             return False
+        urls = [
+            f"https://padlet.com/api/5/wall_sections/{section_id}",
+            f"https://padlet.com/api/5/wall_sections/{section_id}?soft_delete=true",
+            f"https://padlet.com/api/8/wall_sections/{section_id}",
+            f"https://padlet.com/api/10/wall_sections/{section_id}"
+        ]
+        if wall_id:
+            urls.append(f"https://padlet.com/api/5/wall_sections/{section_id}?wall_id={wall_id}")
+            urls.append(f"https://padlet.com/api/8/walls/{wall_id}/wall_sections/{section_id}")
+            urls.append(f"https://padlet.com/api/10/walls/{wall_id}/wall_sections/{section_id}")
+        for u in urls:
+            try:
+                res = self.request('DELETE', u, timeout=5)
+                if res.status_code in (200, 204):
+                    return True
+            except Exception:
+                continue
+        return False
 
     # -------------------------------------------------------------
     # コラボレーター / 権限 関連 API
     # -------------------------------------------------------------
     def get_collaborators(self, wall_hashid: str, wall_id: Optional[int] = None) -> List[Dict[str, Any]]:
-        """コラボレーター一覧取得"""
+        """コラボレーター一覧取得 (全エンドポイント統合 & ID/名前/権限の確実な取得)"""
         collabs = []
+        seen_uids = set()
+
+        def _add_collab(raw_id, hashid="", name="", username="", role=""):
+            uid = str(raw_id).strip() if raw_id is not None and str(raw_id).strip() != "" else ""
+            if uid and uid not in seen_uids and uid != "anonymous":
+                seen_uids.add(uid)
+                collabs.append({
+                    "user_id": uid,
+                    "hashid": str(hashid or "").strip(),
+                    "name": str(name or username or "Unknown").strip(),
+                    "username": str(username or "").strip(),
+                    "role": str(role or "").strip().lower()
+                })
+
         # 方法1: access-settings (wall_hashid)
         if wall_hashid:
             try:
@@ -504,15 +634,8 @@ class PadletClient:
                 if res.status_code == 200:
                     items = res.json().get("data", {}).get("attributes", {}).get("collaborators", [])
                     for c in items:
-                        collabs.append({
-                            "user_id": str(c.get("id")),
-                            "hashid": c.get("hashid"),
-                            "name": c.get("name") or c.get("username", "Unknown"),
-                            "username": c.get("username"),
-                            "role": c.get("role")
-                        })
-                    if collabs:
-                        return collabs
+                        raw_id = c.get("id") or c.get("user_id") or c.get("userId")
+                        _add_collab(raw_id, c.get("hashid"), c.get("name"), c.get("username"), c.get("role"))
             except Exception:
                 pass
 
@@ -522,13 +645,36 @@ class PadletClient:
                 res = self.request('GET', f"https://padlet.com/api/8/walls/{wall_id}/collaborators")
                 if res.status_code == 200:
                     for c in res.json().get("data", []):
-                        collabs.append({
-                            "user_id": str(c.get("id")),
-                            "name": c.get("name") or "Unknown",
-                            "role": c.get("role")
-                        })
+                        raw_id = c.get("id") or c.get("user_id") or c.get("userId")
+                        _add_collab(raw_id, c.get("hashid"), c.get("name"), c.get("username"), c.get("role"))
             except Exception:
                 pass
+
+        # 方法3: /api/8/walls/{wall_id}/user-collaborators & /api/10/walls/{wall_id}/user-collaborators
+        if wall_id:
+            for ep in [f"https://padlet.com/api/8/walls/{wall_id}/user-collaborators", f"https://padlet.com/api/10/walls/{wall_id}/user-collaborators"]:
+                try:
+                    res = self.request('GET', ep)
+                    if res.status_code == 200:
+                        res_json = res.json()
+                        inc_map = {}
+                        for inc in res_json.get("included", []):
+                            if inc.get("type") in ("user", "users"):
+                                inc_map[str(inc.get("id", ""))] = inc.get("attributes", {})
+
+                        for c in res_json.get("data", []):
+                            attrs = c.get("attributes", {})
+                            raw_id = attrs.get("user_id") or attrs.get("userId") or c.get("id")
+                            user_rel = c.get("relationships", {}).get("user", {}).get("data", {})
+                            if not raw_id and user_rel:
+                                raw_id = user_rel.get("id")
+                            
+                            uinfo = inc_map.get(str(raw_id), {}) if raw_id else {}
+                            uname = attrs.get("username") or uinfo.get("username")
+                            name = attrs.get("name") or uinfo.get("name")
+                            _add_collab(raw_id, attrs.get("hashid"), name, uname, attrs.get("role"))
+                except Exception:
+                    pass
 
         return collabs
 
