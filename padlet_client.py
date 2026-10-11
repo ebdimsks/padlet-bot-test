@@ -1,5 +1,6 @@
 import re
 import time
+import threading
 import requests
 from typing import Optional, Dict, List, Any
 from urllib.parse import quote
@@ -27,6 +28,7 @@ class PadletClient:
         self.session = requests.Session()
         self.session.mount('https://', TLSAdapter())
         self._next_allowed = 0.0
+        self._rate_lock = threading.Lock()
         self.owner_id: Optional[str] = None
 
     def set_credentials(self, api_key: str = "", session_token: str = "", secondary_session_token: str = ""):
@@ -85,18 +87,39 @@ class PadletClient:
                 pass
 
     def request(self, method: str, url: str, is_official: bool = False, **kwargs) -> requests.Response:
-        """内部APIレートリミットを考慮した安全・高速なHTTPリクエスト実行"""
-        wait = self._next_allowed - time.time()
-        if wait > 0:
-            time.sleep(wait)
+        """内部APIレートリミットを考慮した安全・高速なHTTPリクエスト実行 (429自動リトライ＆分散)"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            with self._rate_lock:
+                wait = self._next_allowed - time.time()
+                if wait > 0:
+                    time.sleep(min(wait, 3.0))
 
-        headers = self._get_internal_headers()
-        if 'headers' in kwargs:
-            headers.update(kwargs.pop('headers'))
+            headers = self._get_internal_headers()
+            if 'headers' in kwargs:
+                headers.update(kwargs['headers'])
 
-        timeout = kwargs.pop('timeout', 12)
-        response = self.session.request(method, url, headers=headers, timeout=timeout, **kwargs)
-        self._handle_rate_limit(response)
+            timeout = kwargs.get('timeout', 12)
+            req_kwargs = {k: v for k, v in kwargs.items() if k not in ('headers', 'timeout')}
+            
+            try:
+                response = self.session.request(method, url, headers=headers, timeout=timeout, **req_kwargs)
+                self._handle_rate_limit(response)
+
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    backoff = float(retry_after) if retry_after else (0.8 * (attempt + 1))
+                    with self._rate_lock:
+                        self._next_allowed = max(self._next_allowed, time.time() + backoff)
+                    time.sleep(backoff)
+                    continue
+
+                return response
+            except requests.RequestException:
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(0.5)
+
         return response
 
     # -------------------------------------------------------------

@@ -50,6 +50,13 @@ class SpamMonitorEngine:
         self.user_image_history: Dict[str, List[tuple]] = {}
         # 既知の投稿IDセット (サイクルごとの新規投稿検知・暴走防止用)
         self.known_post_ids: Set[str] = set()
+        # 初回起動時の初期スキャン完了フラグ (起動時に元からある既存投稿の誤検知完全防止)
+        self.has_initialized_posts: bool = False
+        self.current_wall_id: Optional[int] = None
+        # 並立処罰パイプライン (1人対処中も他人の荒らしを並行して検知・処罰)
+        self.pipeline_lock = threading.Lock()
+        self.active_punishing_uids: Set[str] = set()
+        self.active_deleting_post_ids: Set[str] = set()
         # 短時間アクティビティ履歴 (DDoS検知用): [(timestamp, user_id, post_id)]
         self.recent_activity_log: List[tuple] = []
         # 復元中フラグ
@@ -67,6 +74,13 @@ class SpamMonitorEngine:
 
     def stop(self):
         self.running = False
+        self.has_initialized_posts = False
+        self.known_post_ids.clear()
+        self.user_post_timestamps.clear()
+        self.user_image_history.clear()
+        with self.pipeline_lock:
+            self.active_punishing_uids.clear()
+            self.active_deleting_post_ids.clear()
         self.add_log("SYSTEM", "監視エンジンを停止しました")
 
     def send_notification(self, title: str, description: str, color: int = 0xFF4B4B, fields: Optional[List[Dict[str, Any]]] = None, mention_everyone: bool = True):
@@ -305,10 +319,26 @@ class SpamMonitorEngine:
         # 削除対象投稿IDの集合 (荒らし投稿、非コラボ投稿、キャプション50文字以上)
         posts_to_delete: Set[str] = set()
 
+        # ボードが切り替わった場合のリセット
+        if self.current_wall_id != main_wall_id:
+            self.current_wall_id = main_wall_id
+            self.has_initialized_posts = False
+            self.known_post_ids.clear()
+            self.user_post_timestamps.clear()
+            self.user_image_history.clear()
+
         # 現在存在する全投稿ID
         current_post_ids = {p.get("id") for p in posts if p.get("id")}
-        # 前回のサイクル以降に新しく検出された投稿
-        new_posts = [p for p in posts if p.get("id") and p.get("id") not in self.known_post_ids]
+
+        # 初回起動時の安全ガード: ボードに元からある既存投稿をすべて安全に記録（誤検知の完全防止）
+        if not self.has_initialized_posts:
+            self.known_post_ids = set(current_post_ids)
+            self.has_initialized_posts = True
+            new_posts = []  # 初回は既存投稿を登録するだけで新規投稿判定は行わない
+            self.add_log("SYSTEM", f"ボード初期化完了: 既存投稿{len(current_post_ids)}件を安全に除外登録しました")
+        else:
+            # 前回のサイクル以降に新しく検出された投稿のみを対象とする
+            new_posts = [p for p in posts if p.get("id") and p.get("id") not in self.known_post_ids]
 
         # -------------------------------------------------------------
         # 【投稿荒らし検知 ①】1秒間に2投稿以上、または2秒間に4投稿以上
@@ -444,16 +474,21 @@ class SpamMonitorEngine:
         # 既知投稿IDの更新 (次回サイクルの新規投稿判定用)
         self.known_post_ids = current_post_ids
 
-        # (E) 処罰 & 削除の超高速並列実行 (20人同時荒らし・大量投稿一括鎮圧)
+        # (E) 処罰 & 削除の超高速並列・並立実行 (20人同時荒らし・並行防衛)
+        # 1人の処罰中であっても監視ループは止まらず、他の荒らし検知・処罰を並立して実行！
         if spammer_uids_to_punish or posts_to_delete:
-            self._handle_spammers_batch(
-                main_wall_id=main_wall_id,
-                main_wall_hashid=main_wall_hashid,
-                spammer_ids=spammer_uids_to_punish,
-                posts_to_delete=posts_to_delete,
-                collab_map=collab_map,
-                expected_visitor_role=expected_visitor_role
-            )
+            with self.pipeline_lock:
+                new_spammers = set(spammer_uids_to_punish) - self.active_punishing_uids
+                new_posts_to_del = set(posts_to_delete) - self.active_deleting_post_ids
+                self.active_punishing_uids.update(new_spammers)
+                self.active_deleting_post_ids.update(new_posts_to_del)
+
+            if new_spammers or new_posts_to_del:
+                threading.Thread(
+                    target=self._handle_spammers_batch,
+                    args=(main_wall_id, main_wall_hashid, new_spammers, new_posts_to_del, dict(collab_map), expected_visitor_role),
+                    daemon=True
+                ).start()
 
     def _handle_spammers_batch(self, main_wall_id: int, main_wall_hashid: str, spammer_ids: Set[str], posts_to_delete: Set[str], collab_map: Dict[str, Any], expected_visitor_role: str):
         """
@@ -482,7 +517,7 @@ class SpamMonitorEngine:
                         logger.warning(f"読者設定失敗 (UID: {uid}): {e}")
                     return False
 
-                with ThreadPoolExecutor(max_workers=min(len(spammer_list), 10)) as executor:
+                with ThreadPoolExecutor(max_workers=min(max(len(spammer_list), 4), 20)) as executor:
                     futures = [executor.submit(_demote_user, uid) for uid in spammer_list]
                     for f in as_completed(futures):
                         if f.result():
@@ -504,7 +539,7 @@ class SpamMonitorEngine:
                     except Exception:
                         return False
 
-                with ThreadPoolExecutor(max_workers=min(len(delete_list), 12)) as executor:
+                with ThreadPoolExecutor(max_workers=min(max(len(delete_list), 4), 20)) as executor:
                     futures = [executor.submit(_delete_p, pid) for pid in delete_list]
                     for f in as_completed(futures):
                         if f.result():
@@ -582,6 +617,10 @@ class SpamMonitorEngine:
         except Exception as e:
             logger.error(f"一括処罰処理エラー: {e}", exc_info=True)
             self.add_log("ERROR", "荒らし処罰中にエラーが発生しました", str(e))
+        finally:
+            with self.pipeline_lock:
+                self.active_punishing_uids.difference_update(spammer_ids)
+                self.active_deleting_post_ids.difference_update(posts_to_delete)
 
     def execute_section_recovery(self, main_wall_id: int, main_wall_hashid: str, polluted_sections: List[Dict[str, Any]], collab_map: Dict[str, Any], owner_id: Optional[str]):
         """
