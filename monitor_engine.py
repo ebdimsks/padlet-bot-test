@@ -56,34 +56,113 @@ class SpamMonitorEngine:
         self.running = False
         self.add_log("SYSTEM", "監視エンジンを停止しました")
 
-    def send_discord_webhook(self, title: str, description: str, color: int = 0xFF4B4B, fields: Optional[List[Dict[str, Any]]] = None, mention_everyone: bool = True):
-        """Discord Webhook 通知送信 (@everyone メンション付き & 詳細埋め込み)"""
+    def send_notification(self, title: str, description: str, color: int = 0xFF4B4B, fields: Optional[List[Dict[str, Any]]] = None, mention_everyone: bool = True):
+        """
+        アラート・防衛通知送信
+        - Discord Webhookが設定されている場合: Discordに@everyoneメンション付きで即時送信
+        - Discord Webhookが未設定(空)の場合: Padletボード内の指定通知セクションに自動投稿
+        """
         data = self.get_data()
         webhook_url = data.get("discord_webhook_url", "").strip()
-        if not webhook_url:
+
+        if webhook_url:
+            # 1. Discord Webhook 通知
+            embed = {
+                "title": f"🛡️ Padlet防衛Bot: {title}",
+                "description": description,
+                "color": color,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "footer": {"text": "Padlet Anti-Spam Bot Ultra 2.0 • 24時間監視防衛システム"}
+            }
+            if fields:
+                embed["fields"] = fields
+
+            payload = {
+                "content": "@everyone" if mention_everyone else None,
+                "embeds": [embed]
+            }
+
+            try:
+                res = requests.post(webhook_url, json=payload, timeout=6)
+                if res.status_code not in (200, 204):
+                    logger.warning(f"Discord通知ステータスコード異常: {res.status_code}")
+            except Exception as e:
+                logger.error(f"Discord通知送信エラー: {e}")
+        else:
+            # 2. Padlet ボード内通知セクションへの投稿作成
+            self._send_padlet_board_notification(title, description, fields)
+
+    def send_discord_webhook(self, title: str, description: str, color: int = 0xFF4B4B, fields: Optional[List[Dict[str, Any]]] = None, mention_everyone: bool = True):
+        """後方互換用エイリアス"""
+        self.send_notification(title, description, color, fields, mention_everyone)
+
+    def _send_padlet_board_notification(self, title: str, description: str, fields: Optional[List[Dict[str, Any]]] = None):
+        """
+        Discord Webhook未指定時、Padletの指定セクションに防衛ログ・通知投稿を作成
+        カスタムキー/カスタム値(custom_properties)にも完全対応
+        """
+        data = self.get_data()
+        main_board = data.get("main_board", {})
+        wall_id = main_board.get("wall_id")
+        wall_hashid = main_board.get("wall_hashid")
+        if not wall_id or not wall_hashid:
             return
 
-        embed = {
-            "title": f"🛡️ Padlet防衛Bot: {title}",
-            "description": description,
-            "color": color,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "footer": {"text": "Padlet Anti-Spam Bot Ultra 2.0 • 24時間監視防衛システム"}
-        }
-        if fields:
-            embed["fields"] = fields
+        notification_sec_id = data.get("notification_section_id")
 
-        payload = {
-            "content": "@everyone" if mention_everyone else None,
-            "embeds": [embed]
-        }
+        # セクションが未指定の場合、メインボードのセクションから探索、なければ自動作成
+        if not notification_sec_id:
+            sections = self.client.get_sections(wall_id)
+            notify_sec = next((s for s in sections if "通知" in s.get("title", "") or "ログ" in s.get("title", "") or "bot" in s.get("title", "").lower()), None)
+            if notify_sec:
+                notification_sec_id = notify_sec["id"]
+            elif sections:
+                notification_sec_id = sections[0]["id"]
+            else:
+                created = self.client.create_section(wall_id, "🔔防衛Bot通知")
+                if created:
+                    notification_sec_id = created["id"]
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        body_lines = [
+            "【🛡️ Padlet防衛Bot通知】",
+            description,
+            ""
+        ]
+        if fields:
+            for f in fields:
+                name = f.get("name", "")
+                val = f.get("value", "")
+                body_lines.append(f"▶ {name}: {val}")
+            body_lines.append("")
+        body_lines.append(f"⏱️ 発生時刻: {now_str}")
+        full_body = "\n".join(body_lines)
+
+        subject = f"🛡️ [防衛通知] {title}"
+
+        # 誤削除防止用フィンガープリント登録
+        fp = f"{subject}:::{full_body}"
+        self.protected_post_fingerprints.add(fp)
+
+        custom_key = data.get("custom_key")
+        custom_value = data.get("custom_value")
 
         try:
-            res = requests.post(webhook_url, json=payload, timeout=6)
-            if res.status_code not in (200, 204):
-                logger.warning(f"Discord通知ステータスコード異常: {res.status_code}")
+            ok = self.client.create_post(
+                wall_id=wall_id,
+                subject=subject,
+                body=full_body,
+                section_id=str(notification_sec_id) if notification_sec_id else None,
+                board_hashid=wall_hashid,
+                custom_key=custom_key,
+                custom_value=custom_value
+            )
+            if ok:
+                self.add_log("NOTIFICATION", f"Padletボード内に通知を投稿しました: {title}", f"セクション: {notification_sec_id}")
+            else:
+                logger.warning("Padletボード内通知の作成に失敗しました")
         except Exception as e:
-            logger.error(f"Discord通知送信エラー: {e}")
+            logger.error(f"Padlet通知作成エラー: {e}")
 
     def _monitor_loop(self):
         """高頻度監視ループ (デュアルアカウント・レート制限分散)"""
@@ -319,9 +398,9 @@ class SpamMonitorEngine:
                 if author_id in exempt_admins or collab_map.get(author_id, {}).get("username") in exempt_admins:
                     continue  # 免除者は保護
 
-                # 復旧処理でコピーされた投稿は誤削除しない
+                # 復旧処理でコピーされた投稿やBotの防衛通知投稿は誤削除しない
                 fp = f"{p.get('subject', '')}:::{p.get('content', '')}"
-                if fp in self.protected_post_fingerprints:
+                if fp in self.protected_post_fingerprints or (p.get("subject") or "").startswith("🛡️ [防衛通知]"):
                     continue
 
                 content = (p.get("content") or "").strip()
@@ -611,7 +690,10 @@ class SpamMonitorEngine:
                         body=content,
                         section_id=target_sec_id,
                         attachment=attachment,
-                        board_hashid=main_wall_hashid
+                        board_hashid=main_wall_hashid,
+                        custom_properties=bp.get("custom_properties"),
+                        custom_key=data.get("custom_key"),
+                        custom_value=data.get("custom_value")
                     )
                     return ok
 
@@ -717,7 +799,10 @@ class SpamMonitorEngine:
                 body=content,
                 section_id=target_sec_id,
                 attachment=attachment,
-                board_hashid=main_wall_hashid
+                board_hashid=main_wall_hashid,
+                custom_properties=bp.get("custom_properties"),
+                custom_key=data.get("custom_key"),
+                custom_value=data.get("custom_value")
             )
 
         with ThreadPoolExecutor(max_workers=5) as executor:

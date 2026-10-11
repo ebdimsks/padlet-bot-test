@@ -17,11 +17,12 @@ class TLSAdapter(HTTPAdapter):
 
 
 class PadletClient:
-    """Padlet 内部APIおよび公式APIを統合操作するクライアント"""
+    """Padlet 完全内部API専用クライアント (公式有料APIは完全不使用・完全無料稼働)"""
 
     def __init__(self, api_key: str = "", session_token: str = "", secondary_session_token: str = ""):
-        self.api_key = api_key.strip()
-        self.session_tokens = [t.strip() for t in [session_token, secondary_session_token] if t.strip()]
+        # 有料APIキーは完全撤廃。トークンがセッショントークンとして渡された場合も自動吸収
+        tokens = [t.strip() for t in [session_token, secondary_session_token, api_key] if t and t.strip()]
+        self.session_tokens = tokens
         self._token_index = 0
         self.session = requests.Session()
         self.session.mount('https://', TLSAdapter())
@@ -29,9 +30,7 @@ class PadletClient:
         self.owner_id: Optional[str] = None
 
     def set_credentials(self, api_key: str = "", session_token: str = "", secondary_session_token: str = ""):
-        if api_key:
-            self.api_key = api_key.strip()
-        tokens = [t.strip() for t in [session_token, secondary_session_token] if t.strip()]
+        tokens = [t.strip() for t in [session_token, secondary_session_token, api_key] if t and t.strip()]
         if tokens:
             self.session_tokens = tokens
 
@@ -43,22 +42,9 @@ class PadletClient:
         self._token_index += 1
         return token
 
-    def _get_official_headers(self) -> Dict[str, str]:
-        """公式 REST API (api.padlet.dev) 用ヘッダー"""
-        headers = {
-            'Accept': 'application/vnd.api+json, application/json',
-            'Content-Type': 'application/json',
-            'User-Agent': 'PadletAntiSpamBot/2.0'
-        }
-        if self.api_key:
-            headers['X-API-KEY'] = self.api_key
-        elif self.session_tokens:
-            headers['X-API-KEY'] = self.session_tokens[0]
-        return headers
-
     def _get_internal_headers(self) -> Dict[str, str]:
-        """削除・セクション操作・権限降格用の内部 API (padlet.com) 用ヘッダー (アカウント交互ローテーション)"""
-        token = self._get_active_session_token() or self.api_key
+        """内部 API (padlet.com) 用ヘッダー (アカウント交互ローテーション & ブラウザ完全模倣)"""
+        token = self._get_active_session_token()
         raw_token = token.replace("Bearer ", "").strip()
         return {
             'Authorization': f"Bearer {raw_token}" if raw_token else "",
@@ -99,12 +85,12 @@ class PadletClient:
                 pass
 
     def request(self, method: str, url: str, is_official: bool = False, **kwargs) -> requests.Response:
-        """レートリミットを考慮したHTTPリクエスト実行"""
+        """内部APIレートリミットを考慮した安全・高速なHTTPリクエスト実行"""
         wait = self._next_allowed - time.time()
         if wait > 0:
             time.sleep(wait)
 
-        headers = self._get_official_headers() if is_official else self._get_internal_headers()
+        headers = self._get_internal_headers()
         if 'headers' in kwargs:
             headers.update(kwargs.pop('headers'))
 
@@ -224,11 +210,32 @@ class PadletClient:
             pass
         return {}
 
+    def detect_custom_properties(self, wall_hashid: str) -> tuple[Optional[str], Optional[str]]:
+        """
+        最新の投稿を取得し、既存の投稿に投稿フィールド(custom_properties)がある場合は、
+        カスタムキーとカスタム値を自動検出して返す。
+        """
+        if not wall_hashid:
+            return None, None
+        try:
+            res = self.request('GET', f"https://padlet.com/api/10/wishes?wall_hashid={wall_hashid}&page=1&limit=50")
+            if res.status_code == 200:
+                wishes = res.json().get("data", [])
+                for w in wishes:
+                    cp = w.get("attributes", {}).get("custom_properties")
+                    if cp and isinstance(cp, dict):
+                        for k, v in cp.items():
+                            if k and str(v).strip():
+                                return str(k).strip(), str(v).strip()
+        except Exception:
+            pass
+        return None, None
+
     # -------------------------------------------------------------
     # 投稿 (Wishes) 関連 API
     # -------------------------------------------------------------
     def get_posts(self, wall_hashid: str, limit: int = 100) -> List[Dict[str, Any]]:
-        """全投稿を取得"""
+        """全投稿を取得 (custom_properties等の詳細属性も完全抽出)"""
         posts = []
         page = 1
         while page <= 10:  # 最大1000件まで探索
@@ -269,6 +276,8 @@ class PadletClient:
                         attachment_caption = str(attrs.get("caption") or "")
 
                     author_id = attrs.get("author_id")
+                    custom_props = attrs.get("custom_properties")
+
                     posts.append({
                         "id": str(item.get("id")),
                         "subject": subject_text,
@@ -277,6 +286,7 @@ class PadletClient:
                         "attachment": attachment_url,
                         "attachment_caption": attachment_caption.strip(),
                         "section_id": str(attrs.get("wall_section_id", "")) if attrs.get("wall_section_id") else None,
+                        "custom_properties": custom_props if isinstance(custom_props, dict) else None,
                         "created_at": attrs.get("created_at")
                     })
 
@@ -288,78 +298,75 @@ class PadletClient:
 
         return posts
 
-    def create_post(self, wall_id: int, subject: str = "", body: str = "", section_id: Optional[str] = None, attachment: Optional[str] = None, board_hashid: Optional[str] = None) -> bool:
-        """投稿作成 (公式REST API & 内部APIの多重フォールバック対応)"""
-        # 1. 公式 REST API (JSON:API 形式) で試行
-        target_board_id = board_hashid or str(wall_id)
-        if target_board_id and self.api_key:
-            official_url = f"https://api.padlet.dev/v1/boards/{target_board_id}/posts"
-            content_obj: Dict[str, Any] = {
-                "subject": subject or "",
-                "body": body or ""
-            }
-            if attachment:
-                content_obj["attachment"] = {"url": attachment}
+    def create_post(
+        self,
+        wall_id: int,
+        subject: str = "",
+        body: str = "",
+        section_id: Optional[str] = None,
+        attachment: Optional[str] = None,
+        board_hashid: Optional[str] = None,
+        custom_key: Optional[str] = None,
+        custom_value: Optional[str] = None,
+        custom_properties: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        投稿作成 (完全内部API: POST https://padlet.com/api/5/wishes)
+        有料APIは完全不使用。カスタム投稿フィールド(custom_properties)にも完全対応。
+        """
+        wall_id_num = int(wall_id) if str(wall_id).isdigit() else wall_id
+        sec_num = int(section_id) if (section_id and str(section_id).isdigit()) else section_id
 
-            data_obj: Dict[str, Any] = {
-                "type": "post",
-                "attributes": {
-                    "content": content_obj
-                }
-            }
-            if section_id:
-                data_obj["relationships"] = {
-                    "section": {
-                        "data": {
-                            "id": str(section_id),
-                            "type": "section"
-                        }
-                    }
-                }
+        # カスタムフィールド辞書の構築
+        cp_dict: Dict[str, Any] = {}
+        if custom_properties and isinstance(custom_properties, dict):
+            cp_dict.update(custom_properties)
+        if custom_key and str(custom_key).strip():
+            cp_dict[str(custom_key).strip()] = str(custom_value or "").strip()
 
-            official_payload = {"data": data_obj}
-            try:
-                res = self.request('POST', official_url, is_official=True, json=official_payload, timeout=8)
-                if res.status_code in (200, 201):
-                    return True
-            except Exception:
-                pass
-
-        # 2. 内部 API (POST /api/5/wishes) フォーマット1
+        # パターン1: bodyがプレーンテキスト + wall_section_id (標準形式)
         payload1: Dict[str, Any] = {
-            "wallId": wall_id,
-            "wall_id": wall_id,
-            "body": {"text": body}
+            "wallId": wall_id_num,
+            "wall_id": wall_id_num,
+            "subject": subject or "",
+            "body": body or ""
         }
-        if subject:
-            payload1["subject"] = subject
-        if section_id:
-            payload1["wallSectionId"] = section_id
-            payload1["wall_section_id"] = section_id
+        if sec_num is not None:
+            payload1["wallSectionId"] = sec_num
+            payload1["wall_section_id"] = sec_num
+        if cp_dict:
+            payload1["custom_properties"] = cp_dict
         if attachment:
             payload1["attachment"] = attachment
+            payload1["wish_content"] = {
+                "attachment_props": {"url": attachment},
+                "is_processed": False
+            }
+
+        url1 = "https://padlet.com/api/5/wishes"
+        if sec_num is not None:
+            url1 = f"https://padlet.com/api/5/wishes?wall_id={wall_id_num}&wall_section_id={sec_num}"
 
         try:
-            res = self.request('POST', "https://padlet.com/api/5/wishes", json=payload1, timeout=8)
+            res = self.request('POST', url1, json=payload1, timeout=8)
             if res.status_code in (200, 201):
                 return True
         except Exception:
             pass
 
-        # 3. 内部 API (POST /api/5/wishes) フォーマット2 (bodyがプレーンテキスト)
-        payload2: Dict[str, Any] = {
-            "wallId": wall_id,
-            "wall_id": wall_id,
-            "body": body,
-            "subject": subject
-        }
-        if section_id:
-            payload2["wallSectionId"] = section_id
-        if attachment:
-            payload2["attachment"] = {"url": attachment}
-
+        # パターン2: bodyが {"text": body} 形式
+        payload2 = dict(payload1)
+        payload2["body"] = {"text": body or ""}
         try:
             res = self.request('POST', "https://padlet.com/api/5/wishes", json=payload2, timeout=8)
+            if res.status_code in (200, 201):
+                return True
+        except Exception:
+            pass
+
+        # パターン3: 単純直下POST
+        try:
+            res = self.request('POST', f"https://padlet.com/api/5/wishes?wall_id={wall_id_num}", json=payload1, timeout=8)
             if res.status_code in (200, 201):
                 return True
         except Exception:
@@ -542,34 +549,6 @@ class PadletClient:
                         return True
                 except Exception:
                     pass
-
-        # 3. 公式 REST API での読者(reader)登録
-        target_board = board_hashid or str(wall_id)
-        if target_board and self.api_key:
-            official_url = f"https://api.padlet.dev/v1/boards/{target_board}/collaborators"
-            official_payload = {
-                "data": {
-                    "type": "collaborator",
-                    "attributes": {
-                        "role": role
-                    },
-                    "relationships": {
-                        "user": {
-                            "data": {
-                                "id": str(user_id),
-                                "type": "user"
-                            }
-                        }
-                    }
-                }
-            }
-            try:
-                res = self.request('POST', official_url, is_official=True, json=official_payload, timeout=6)
-                if res.status_code in (200, 201, 204):
-                    return True
-            except Exception:
-                pass
-
         return False
 
     def change_visitor_role(self, wall_hashid: str, role: str = "reader", wall_id: Optional[int] = None) -> bool:

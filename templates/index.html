@@ -284,32 +284,67 @@
     </header>
 
     <div class="grid">
-      <!-- 認証 & Discord連携 -->
+      <!-- 認証 & Discord連携 / Padlet内通知 -->
       <div class="card">
-        <h2>🔑 API & デュアルアカウント設定</h2>
-        <div class="form-group">
-          <label>Padlet 公式 API Key</label>
-          <input type="password" id="padletApiKey" placeholder="公式Developer画面で発行したAPI Key">
-          <small style="color: var(--text-muted);">ボード詳細の取得や投稿の作成に使用</small>
+        <h2>🔑 API & アカウント・通知設定 (完全内部API対応)</h2>
+        <div class="form-group" style="background: rgba(56, 189, 248, 0.05); padding: 10px; border-radius: 8px; border: 1px solid rgba(56, 189, 248, 0.2); margin-bottom: 12px;">
+          <small style="color: var(--accent); font-weight: 600;">✨ 完全無料・内部APIモード稼働中</small>
+          <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 2px;">
+            公式有料APIは完全不要。Session Tokenのみで荒らし防衛・復旧・通知の全機能が動作します。
+          </div>
         </div>
         <div class="form-group">
-          <label>Padlet Session Token 1 (メインアカウント)</label>
+          <label>Padlet Session Token 1 (メインアカウント) <span style="color: var(--danger);">*必須</span></label>
           <input type="password" id="padletSessionToken" placeholder="アカウント1のBearerトークン">
         </div>
         <div class="form-group">
           <label>Padlet Session Token 2 (サブアカウント - レート制限分散用)</label>
           <input type="password" id="padletSecondaryToken" placeholder="アカウント2のBearerトークン (2アカウント体制)">
-          <small style="color: var(--text-muted);">2個のアカウントを交互に使い、429制限を回避して超高速防衛</small>
+          <small style="color: var(--text-muted);">2アカウント交互通信で429制限を回避し、超高速防衛を実現</small>
         </div>
         <div class="form-group">
           <label>Discord Webhook URL (リアルタイム通知)</label>
-          <input type="text" id="discordWebhook" placeholder="https://discord.com/api/webhooks/...">
+          <input type="text" id="discordWebhook" placeholder="https://discord.com/api/webhooks/... (空欄の場合はPadletで通知)">
+          <small style="color: var(--text-muted);">※ Webhook未指定の場合は、下記のPadlet通知セクションに自動投稿されます</small>
         </div>
-        <div class="form-group">
+
+        <!-- Webhook未指定時のPadlet内通知セクション -->
+        <div class="form-group" style="background: rgba(16, 185, 129, 0.08); padding: 12px; border-radius: 8px; border: 1px solid rgba(16, 185, 129, 0.25);">
+          <label style="color: #34d399; font-weight: 600;">🔔 Padlet ボード内通知セクション (Webhook未指定時)</label>
+          <div style="display: flex; gap: 8px; margin-top: 6px;">
+            <select id="notificationSectionSelect" style="flex: 1;">
+              <option value="">(未選択 - 先頭セクションまたは自動作成)</option>
+            </select>
+            <button type="button" class="btn btn-outline" style="border-color: #34d399; color: #34d399; white-space: nowrap;" onclick="createNotifySection()">➕ 自動作成</button>
+          </div>
+          <small style="color: var(--text-muted); display: block; margin-top: 6px;">
+            ※ Discord Webhookが空の場合、荒らし処罰や復旧ログがこのセクションへ投稿されます。
+          </small>
+        </div>
+
+        <!-- 投稿フィールド (custom_properties) 自動検出 -->
+        <div class="form-group" style="background: rgba(245, 158, 11, 0.08); padding: 12px; border-radius: 8px; border: 1px solid rgba(245, 158, 11, 0.25); margin-top: 10px;">
+          <label style="color: #fbbf24; font-weight: 600;">🏷️ 投稿フィールド (custom_properties - 自動検出)</label>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px;">
+            <div>
+              <label style="font-size: 0.75rem;">カスタムキー</label>
+              <input type="text" id="customKeyInput" placeholder="例: custom_field_1">
+            </div>
+            <div>
+              <label style="font-size: 0.75rem;">カスタム値</label>
+              <input type="text" id="customValueInput" placeholder="例: default_value">
+            </div>
+          </div>
+          <small style="color: var(--text-muted); display: block; margin-top: 6px;">
+            ※ ボードURL設定時に既存の投稿から自動検出されます。手動修正も可能です。
+          </small>
+        </div>
+
+        <div class="form-group" style="margin-top: 12px;">
           <label>監視間隔 (秒 - 推奨: 1.0秒で超高速監視)</label>
           <input type="number" id="pollInterval" min="0.5" max="60" step="0.5" value="1.0">
         </div>
-        <button class="btn btn-outline" style="width: 100%;" onclick="saveBasicConfig()">アカウント設定を保存</button>
+        <button class="btn btn-outline" style="width: 100%;" onclick="saveBasicConfig()">アカウント・通知設定を保存</button>
       </div>
 
       <!-- メインボード設定 (URL自動解決) -->
@@ -492,10 +527,11 @@
 
       // フォーム値の反映（初回のみ）
       if (!window._formLoaded) {
-        document.getElementById('padletApiKey').value = appConfig.padlet_api_key || '';
         document.getElementById('padletSessionToken').value = appConfig.padlet_session_token || appConfig.padlet_token || '';
         document.getElementById('padletSecondaryToken').value = appConfig.padlet_secondary_token || '';
         document.getElementById('discordWebhook').value = appConfig.discord_webhook_url || '';
+        document.getElementById('customKeyInput').value = appConfig.custom_key || '';
+        document.getElementById('customValueInput').value = appConfig.custom_value || '';
         document.getElementById('pollInterval').value = appConfig.poll_interval_seconds || 1.0;
         document.getElementById('defaultVisitorRole').value = appConfig.default_visitor_role || 'reader';
         document.getElementById('maxSections').value = appConfig.max_sections || 10;
@@ -517,6 +553,7 @@
         if (appConfig.main_board && appConfig.main_board.wall_id) {
           renderBoardPreview('main', appConfig.main_board);
           document.getElementById('mainBoardUrl').value = appConfig.main_board.original_url || '';
+          fetchSectionsAndPopulate(appConfig.notification_section_id);
         }
         if (appConfig.backup_board && appConfig.backup_board.wall_id) {
           renderBoardPreview('backup', appConfig.backup_board);
@@ -583,6 +620,52 @@
       fetchStatus();
     }
 
+    function populateSectionSelect(sections, selectedId) {
+      const sel = document.getElementById('notificationSectionSelect');
+      if (!sel) return;
+      sel.innerHTML = '<option value="">(未選択 - 先頭セクションまたは自動作成)</option>';
+      (sections || []).forEach(s => {
+        const opt = document.createElement('option');
+        opt.value = s.id;
+        opt.textContent = `${s.title} (ID: ${s.id})`;
+        if (selectedId && String(s.id) === String(selectedId)) {
+          opt.selected = true;
+        }
+        sel.appendChild(opt);
+      });
+    }
+
+    async function fetchSectionsAndPopulate(selectedId) {
+      try {
+        const res = await fetch('/api/sections');
+        const data = await res.json();
+        if (data.sections) {
+          populateSectionSelect(data.sections, selectedId);
+        }
+      } catch (e) {
+        console.error('セクション一覧取得失敗:', e);
+      }
+    }
+
+    async function createNotifySection() {
+      try {
+        const res = await fetch('/api/sections/create_notify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: '🔔防衛Bot通知' })
+        });
+        const data = await res.json();
+        if (data.success) {
+          alert(`通知用セクション『${data.created.title}』を作成し、通知先に設定しました！`);
+          populateSectionSelect(data.sections, data.created.id);
+        } else {
+          alert(data.error || 'セクション作成に失敗しました');
+        }
+      } catch (e) {
+        alert('通信エラー: ' + e);
+      }
+    }
+
     async function resolveBoard(type) {
       const url = document.getElementById(type === 'main' ? 'mainBoardUrl' : 'backupBoardUrl').value;
       if (!url) {
@@ -597,6 +680,18 @@
       const data = await res.json();
       if (data.success) {
         renderBoardPreview(type, data.resolved);
+        if (type === 'main') {
+          if (data.sections) {
+            populateSectionSelect(data.sections, data.config ? data.config.notification_section_id : null);
+          }
+          if (data.custom_key) {
+            document.getElementById('customKeyInput').value = data.custom_key;
+          }
+          if (data.custom_value) {
+            document.getElementById('customValueInput').value = data.custom_value;
+          }
+          alert(`メインボードを解析しました！\nセクション数: ${(data.sections || []).length}個\n検出投稿フィールド: ${data.custom_key || 'なし'}`);
+        }
       } else {
         alert(data.error);
       }
@@ -612,25 +707,29 @@
     }
 
     async function saveBasicConfig() {
-      const apiKey = document.getElementById('padletApiKey').value;
       const sessionToken = document.getElementById('padletSessionToken').value;
       const secToken = document.getElementById('padletSecondaryToken').value;
       const webhook = document.getElementById('discordWebhook').value;
+      const notifSec = document.getElementById('notificationSectionSelect').value;
+      const customKey = document.getElementById('customKeyInput').value.trim();
+      const customVal = document.getElementById('customValueInput').value.trim();
       const interval = parseFloat(document.getElementById('pollInterval').value);
       const visitorRole = document.getElementById('defaultVisitorRole').value;
       await fetch('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          padlet_api_key: apiKey,
           padlet_session_token: sessionToken,
           padlet_secondary_token: secToken,
           discord_webhook_url: webhook,
+          notification_section_id: notifSec || null,
+          custom_key: customKey,
+          custom_value: customVal,
           poll_interval_seconds: interval,
           default_visitor_role: visitorRole
         })
       });
-      alert('アカウント・全体権限設定を保存しました');
+      alert('アカウント・通知設定を保存しました');
     }
 
     async function saveDefenseRules() {

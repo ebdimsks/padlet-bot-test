@@ -126,6 +126,9 @@ def load_config() -> dict:
 
             _config_cache.setdefault("main_board", {})
             _config_cache.setdefault("backup_board", {})
+            _config_cache.setdefault("notification_section_id", None)
+            _config_cache.setdefault("custom_key", "")
+            _config_cache.setdefault("custom_value", "")
             _config_cache.setdefault("allowed_admins", [])
             _config_cache.setdefault("allowed_moderators", [])
             _config_cache.setdefault("exempt_admins", [])
@@ -230,6 +233,7 @@ def api_save_config():
     # 更新可能なフィールド
     for key in [
         "padlet_api_key", "padlet_session_token", "padlet_secondary_token", "padlet_token", "discord_webhook_url",
+        "notification_section_id", "custom_key", "custom_value",
         "allowed_admins", "allowed_moderators", "exempt_admins",
         "max_sections", "poll_interval_seconds", "default_visitor_role", "ddos_threshold",
         "delete_non_collaborators", "block_duplicates", "block_image_repeat", "block_urls", "max_post_length", "random_str_pattern"
@@ -245,7 +249,10 @@ def api_save_config():
 @app.route("/api/resolve_board", methods=["POST"])
 @auth_required
 def api_resolve_board():
-    """URLからボード情報を自動取得して設定に反映"""
+    """
+    URLからボード情報を自動取得して設定に反映。
+    セクション一覧および既存投稿からの投稿フィールド(custom_properties)の自動検出も行う。
+    """
     data = request.json or {}
     board_type = data.get("type", "main")  # 'main' or 'backup'
     url = data.get("url", "").strip()
@@ -254,24 +261,102 @@ def api_resolve_board():
         return jsonify({"error": "URLを入力してください"}), 400
 
     cfg = load_config()
-    api_key = cfg.get("padlet_api_key", "")
     session_token = cfg.get("padlet_session_token", "") or cfg.get("padlet_token", "")
-    client = PadletClient(api_key=api_key, session_token=session_token)
+    sec_token = cfg.get("padlet_secondary_token", "")
+    client = PadletClient(session_token=session_token, secondary_session_token=sec_token)
 
     resolved = client.resolve_board(url)
     if not resolved:
         return jsonify({"error": "ボード情報の解析に失敗しました。URLまたはアクセス権限をご確認ください。"}), 400
 
     resolved["original_url"] = url
+    wall_id = resolved.get("wall_id")
+    wall_hashid = resolved.get("wall_hashid")
 
+    # セクション一覧の取得
+    sections = []
+    if wall_id:
+        sections = client.get_sections(wall_id)
+        resolved["sections"] = sections
+
+    detected_key, detected_val = None, None
     if board_type == "main":
         cfg["main_board"] = resolved
+        
+        # 既存投稿から投稿フィールド(custom_properties)を自動検出
+        if wall_hashid:
+            detected_key, detected_val = client.detect_custom_properties(wall_hashid)
+            if detected_key:
+                cfg["custom_key"] = detected_key
+                cfg["custom_value"] = detected_val or ""
+                add_log("FIELD", f"投稿フィールド(custom_properties)を自動検出: {detected_key} = {detected_val}")
+
+        # 通知先セクションの自動選定 (未設定の場合)
+        if not cfg.get("notification_section_id") and sections:
+            notify_sec = next((s for s in sections if "通知" in s.get("title", "") or "ログ" in s.get("title", "")), None)
+            if notify_sec:
+                cfg["notification_section_id"] = notify_sec["id"]
+            else:
+                cfg["notification_section_id"] = sections[0]["id"]
     else:
         cfg["backup_board"] = resolved
 
     save_config()
     add_log("BOARD", f"{'メイン' if board_type == 'main' else 'バックアップ'}ボードを設定しました: {resolved.get('title')}")
-    return jsonify({"success": True, "resolved": resolved, "config": cfg})
+    return jsonify({
+        "success": True,
+        "resolved": resolved,
+        "sections": sections,
+        "custom_key": detected_key or cfg.get("custom_key", ""),
+        "custom_value": detected_val or cfg.get("custom_value", ""),
+        "config": cfg
+    })
+
+
+@app.route("/api/sections", methods=["GET"])
+@auth_required
+def api_get_sections():
+    """メインボードのセクション一覧を取得"""
+    cfg = load_config()
+    main_board = cfg.get("main_board", {})
+    wall_id = main_board.get("wall_id")
+    if not wall_id:
+        return jsonify({"sections": []})
+
+    session_token = cfg.get("padlet_session_token", "") or cfg.get("padlet_token", "")
+    sec_token = cfg.get("padlet_secondary_token", "")
+    client = PadletClient(session_token=session_token, secondary_session_token=sec_token)
+    sections = client.get_sections(wall_id)
+    return jsonify({"sections": sections})
+
+
+@app.route("/api/sections/create_notify", methods=["POST"])
+@auth_required
+def api_create_notify_section():
+    """メインボード上に通知用セクション『🔔防衛Bot通知』を新規作成"""
+    cfg = load_config()
+    main_board = cfg.get("main_board", {})
+    wall_id = main_board.get("wall_id")
+    if not wall_id:
+        return jsonify({"error": "メインボードが設定されていません"}), 400
+
+    data = request.json or {}
+    sec_title = data.get("title", "🔔防衛Bot通知").strip() or "🔔防衛Bot通知"
+
+    session_token = cfg.get("padlet_session_token", "") or cfg.get("padlet_token", "")
+    sec_token = cfg.get("padlet_secondary_token", "")
+    client = PadletClient(session_token=session_token, secondary_session_token=sec_token)
+
+    created = client.create_section(wall_id, sec_title)
+    if not created:
+        return jsonify({"error": "通知セクションの作成に失敗しました"}), 500
+
+    cfg["notification_section_id"] = created["id"]
+    save_config()
+    add_log("SECTION", f"通知用セクションを作成しました: {sec_title} (ID: {created['id']})")
+
+    sections = client.get_sections(wall_id)
+    return jsonify({"success": True, "created": created, "sections": sections, "config": cfg})
 
 
 @app.route("/api/bot/toggle", methods=["POST"])
@@ -296,12 +381,12 @@ def api_force_recovery():
     if not main_wall_id:
         return jsonify({"error": "メインボードが設定されていません"}), 400
 
-    api_key = cfg.get("padlet_api_key", "")
     session_token = cfg.get("padlet_session_token", "") or cfg.get("padlet_token", "")
-    if not api_key and not session_token:
-        return jsonify({"error": "Padlet API Key または Session Token が設定されていません"}), 400
+    sec_token = cfg.get("padlet_secondary_token", "")
+    if not session_token:
+        return jsonify({"error": "Padlet Session Token が設定されていません"}), 400
 
-    client = PadletClient(api_key=api_key, session_token=session_token)
+    client = PadletClient(session_token=session_token, secondary_session_token=sec_token)
     main_board = cfg.get("main_board", {})
     main_wall_hashid = main_board.get("wall_hashid", "")
     owner_id = main_board.get("owner_id")
@@ -334,13 +419,13 @@ def api_get_collaborators():
     main_board = cfg.get("main_board", {})
     wall_id = main_board.get("wall_id")
     wall_hashid = main_board.get("wall_hashid")
-    api_key = cfg.get("padlet_api_key", "")
     session_token = cfg.get("padlet_session_token", "") or cfg.get("padlet_token", "")
+    sec_token = cfg.get("padlet_secondary_token", "")
 
     if not wall_hashid:
         return jsonify({"collaborators": []})
 
-    client = PadletClient(api_key=api_key, session_token=session_token)
+    client = PadletClient(session_token=session_token, secondary_session_token=sec_token)
     collabs = client.get_collaborators(wall_hashid, wall_id)
     return jsonify({"collaborators": collabs})
 
